@@ -13,10 +13,14 @@ use std::time::Duration;
 use config::MqttClientConfig;
 use error::MqttEngineError;
 use rumqttc::QoS;
+use tokio::sync::watch;
 
 use crate::message::envelope::MqttMessage;
 use crate::mqtt::engine::MqttEngine;
 use crate::router::matcher::{MqttRouter, TopicParams};
+use crate::web::realtime::{
+    RealtimeBridgeState, default_bind_addr, serve_realtime_bridge_with_state,
+};
 
 pub mod bus;
 pub mod codec;
@@ -25,6 +29,7 @@ pub mod error;
 pub mod message;
 mod mqtt;
 pub mod router;
+pub mod web;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
@@ -79,6 +84,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     let engine = MqttEngine::spawn(config, router)?;
     let mqtt = engine.handle();
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+    let realtime_state = RealtimeBridgeState::new(mqtt.clone())
+        .with_websocket_client_buffer(64)
+        .with_websocket_ping_interval(Duration::from_secs(30))
+        .with_sse_keep_alive_interval(Duration::from_secs(15));
+    let realtime_bind_addr = default_bind_addr();
+
+    let realtime_worker = tokio::spawn(async move {
+        serve_realtime_bridge_with_state(realtime_bind_addr, realtime_state, shutdown_rx).await
+    });
 
     mqtt.publish(
         "devices/local/status",
@@ -89,6 +105,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
     .await?;
 
     tokio::signal::ctrl_c().await?;
+
+    // Ignore send failure because it only means the bridge already stopped.
+    let _ = shutdown_tx.send(true);
+
+    match realtime_worker.await {
+        Ok(Ok(())) => {}
+        Ok(Err(err)) => eprintln!("Realtime bridge stopped with error: {err}"),
+        Err(err) => eprintln!("Realtime bridge task join error: {err}"),
+    }
+
     engine.shutdown().await?;
 
     Ok(())
