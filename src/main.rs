@@ -35,7 +35,7 @@ pub mod web;
 async fn main() -> Result<(), Box<dyn Error>> {
     let router = MqttRouter::new()
         .route(
-            "device/+/telemetry",
+            "devices/+/telemetry",
             |message: MqttMessage, params: TopicParams| async move {
                 // Payload parsing is done after routing.
                 let device_id = params.single(0).unwrap_or("unknown");

@@ -200,8 +200,8 @@ async fn handle_mqtt_event(
         }
         Event::Incoming(Packet::Publish(publish)) => match MqttMessage::from_publish(publish) {
             Ok(message) => {
-                if let Err(err) = bus.enqueue_ingress(message).await {
-                    eprintln!("MQTT route dispatch error: {}", err);
+                if let Err(err) = bus.try_enqueue_ingress(message).await {
+                    eprintln!("MQTT ingress enqueue error: {}", err);
                 }
             }
             Err(err) => {

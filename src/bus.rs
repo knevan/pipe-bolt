@@ -118,6 +118,13 @@ impl InternalBusHandle {
             .map_err(|_| MqttEngineError::IngressClosed)
     }
 
+    pub async fn try_enqueue_ingress(&self, message: MqttMessage) -> Result<(), MqttEngineError> {
+        self.ingress_tx.try_send(message).map_err(|err| match err {
+            TrySendError::Full(_) => MqttEngineError::IngressQueueFull,
+            TrySendError::Closed(_) => MqttEngineError::IngressClosed,
+        })
+    }
+
     pub fn publish_telemetry(&self, event: TelemetryEvent) -> Result<usize, MqttEngineError> {
         // Broadcast is bounded. If lagging receivers cannot keep up, Tokio drops older messages for them.
         match self.telemetry_tx.send(event) {
