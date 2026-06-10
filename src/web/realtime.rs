@@ -11,7 +11,7 @@ use salvo::websocket::{Message, WebSocket};
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::{mpsc, watch};
-use tokio::time::{MissedTickBehavior, interval};
+use tokio::time::{MissedTickBehavior, interval, timeout};
 
 use crate::bus::TelemetryEvent;
 use crate::error::MqttEngineError;
@@ -19,6 +19,7 @@ use crate::mqtt::engine::MqttHandle;
 
 const DEFAULT_WEBSOCKET_CLIENT_BUFFER: usize = 64;
 const DEFAULT_WEBSOCKET_PING_INTERVAL: Duration = Duration::from_secs(30);
+const DEFAULT_WEBSOCKET_SEND_TIMEOUT: Duration = Duration::from_secs(3);
 const DEFAULT_SSE_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(15);
 const WEBSOCKET_MAX_MESSAGE_SIZE: usize = 64 * 1024;
 const WEBSOCKET_MAX_FRAME_SIZE: usize = 64 * 1024;
@@ -28,6 +29,7 @@ pub struct RealtimeBridgeState {
     mqtt: MqttHandle,
     websocket_client_buffer: usize,
     websocket_ping_interval: Duration,
+    websocket_send_timeout: Duration,
     sse_keep_alive_interval: Duration,
 }
 
@@ -37,6 +39,7 @@ impl RealtimeBridgeState {
             mqtt,
             websocket_client_buffer: DEFAULT_WEBSOCKET_CLIENT_BUFFER,
             websocket_ping_interval: DEFAULT_WEBSOCKET_PING_INTERVAL,
+            websocket_send_timeout: DEFAULT_WEBSOCKET_SEND_TIMEOUT,
             sse_keep_alive_interval: DEFAULT_SSE_KEEP_ALIVE_INTERVAL,
         }
     }
@@ -49,6 +52,13 @@ impl RealtimeBridgeState {
     pub fn with_websocket_ping_interval(mut self, interval: Duration) -> Self {
         if !interval.is_zero() {
             self.websocket_ping_interval = interval;
+        }
+        self
+    }
+
+    pub fn with_websocket_send_timeout(mut self, timeout: Duration) -> Self {
+        if !timeout.is_zero() {
+            self.websocket_send_timeout = timeout;
         }
         self
     }
@@ -84,28 +94,28 @@ impl TelemetryFilter {
     }
 
     fn matches(&self, event: &TelemetryEvent) -> bool {
-        if let Some(expected) = self.device.as_deref() {
-            if telemetry_device(&event.topic) != Some(expected) {
-                return false;
-            }
+        if let Some(expected) = self.device.as_deref()
+            && telemetry_device(&event.topic) != Some(expected)
+        {
+            return false;
         }
 
-        if let Some(expected) = self.topic.as_deref() {
-            if event.topic != expected {
-                return false;
-            }
+        if let Some(expected) = self.topic.as_deref()
+            && event.topic != expected
+        {
+            return false;
         }
 
-        if let Some(expected) = self.topic_prefix.as_deref() {
-            if !event.topic.starts_with(expected) {
-                return false;
-            }
+        if let Some(expected) = self.topic_prefix.as_deref()
+            && !topic_matches_prefix(&event.topic, expected)
+        {
+            return false;
         }
 
-        if let Some(expected) = self.event_type.as_deref() {
-            if telemetry_event_type(&event.topic) != Some(expected) {
-                return false;
-            }
+        if let Some(expected) = self.event_type.as_deref()
+            && telemetry_event_type(&event.topic) != Some(expected)
+        {
+            return false;
         }
 
         true
@@ -211,16 +221,8 @@ pub async fn serve_realtime_bridge_with_state(
     let router = realtime_router(state);
 
     tokio::select! {
-        _ = server.serve(router) => {
-            Ok(())
-        }
-        changed = shutdown_rx.changed() => {
-            if changed.is_err() || *shutdown_rx.borrow() {
-                Ok(())
-            } else {
-                Ok(())
-            }
-        }
+        _ = server.serve(router) => Ok(()),
+        _ = shutdown_rx.changed() => Ok(()),
     }
 }
 
@@ -408,7 +410,8 @@ async fn handle_telemetry_socket(
     loop {
         tokio::select! {
             _ = heartbeat.tick() => {
-                if ws_tx.send(Message::ping(Vec::new())).await.is_err() {
+                let ping  = Message::ping(Vec::new());
+                if timeout(state.websocket_send_timeout, ws_tx.send(ping)).await.is_err() {
                     break;
                 }
             }
@@ -417,8 +420,9 @@ async fn handle_telemetry_socket(
                     break;
                 };
 
-                if ws_tx.send(outbound).await.is_err() {
-                    break;
+                match timeout(state.websocket_send_timeout, ws_tx.send(outbound)).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(_)) | Err(_) => break,
                 }
             }
             inbound = ws_rx.next() => {
@@ -543,6 +547,13 @@ fn parse_filter(req: &mut Request) -> Result<TelemetryFilter, StatusError> {
 
     validate_filter(&filter)?;
     Ok(filter)
+}
+
+fn topic_matches_prefix(topic: &str, prefix: &str) -> bool {
+    topic == prefix
+        || topic
+            .strip_prefix(prefix)
+            .is_some_and(|rest| rest.starts_with('/'))
 }
 
 fn validate_filter(filter: &TelemetryFilter) -> Result<(), StatusError> {
