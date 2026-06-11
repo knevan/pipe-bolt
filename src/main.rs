@@ -18,12 +18,12 @@ use tokio::sync::watch;
 use crate::message::envelope::MqttMessage;
 use crate::mqtt::engine::MqttEngine;
 use crate::router::matcher::{MqttRouter, TopicParams};
-use crate::web::realtime::{
-    RealtimeBridgeState, default_bind_addr, serve_realtime_bridge_with_state,
-};
+use crate::web::realtime::router::{default_bind_addr, serve_realtime_bridge_with_state};
+use crate::web::realtime::state::RealtimeBridgeState;
 
 pub mod bus;
 pub mod codec;
+pub mod command;
 pub mod config;
 pub mod error;
 pub mod message;

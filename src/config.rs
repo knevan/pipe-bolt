@@ -3,6 +3,7 @@ use std::time::Duration;
 use rumqttc::{MqttOptions, QoS, Transport};
 
 use crate::error::MqttEngineError;
+use crate::router::matcher::validate_mqtt_topic_filter;
 
 /// TLS mode used by the MQTT client
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
@@ -47,7 +48,7 @@ impl MqttReconnectConfig {
     pub fn validate(&self) -> Result<(), MqttEngineError> {
         if self.min_delay.is_zero() {
             return Err(MqttEngineError::InvalidConfig(
-                "Reconnect min_delay must be greater than is_zero",
+                "reconnect min_delay must be greater than zero",
             ));
         }
 
@@ -61,7 +62,7 @@ impl MqttReconnectConfig {
     }
 }
 
-/// Runtime configuration for the MQTT engine.
+/// Runtime configuration for MQTT connection, subscriptions, reconnect policy, and local queues.
 #[derive(Debug, Clone)]
 pub struct MqttClientConfig {
     pub client_id: String,
@@ -184,11 +185,8 @@ impl MqttClientConfig {
         }
 
         for subscription in &self.subscriptions {
-            if subscription.topic.trim().is_empty() {
-                return Err(MqttEngineError::InvalidConfig(
-                    "subscription topic must not be empty",
-                ));
-            }
+            validate_mqtt_topic_filter(&subscription.topic)
+                .map_err(|_| MqttEngineError::InvalidConfig("subscription topic invalid"))?;
         }
 
         self.reconnect.validate()?;

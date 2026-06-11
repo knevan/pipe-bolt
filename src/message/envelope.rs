@@ -4,6 +4,7 @@ use rumqttc::{Publish, QoS};
 
 use crate::error::MqttEngineError;
 
+/// Normalized MQTT publish envelope used after broker-specific packet conversion.
 #[derive(Debug, Clone)]
 pub struct MqttMessage {
     topic: String,
@@ -68,7 +69,7 @@ impl MqttMessage {
     }
 }
 
-fn validate_topic_name(topic: &str) -> Result<(), MqttEngineError> {
+pub fn validate_topic_name(topic: &str) -> Result<(), MqttEngineError> {
     if topic.is_empty() {
         return Err(MqttEngineError::InvalidTopicName(
             "topic name must not be empty".to_owned(),

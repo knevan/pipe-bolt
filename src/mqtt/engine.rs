@@ -13,7 +13,7 @@ use crate::message::envelope::MqttMessage;
 use crate::mqtt::backoff::ExponentialBackoff;
 use crate::router::matcher::MqttRouter;
 
-/// Cloneable handle intended to be stored in axum/salvo application state
+/// Cloneable handle used by application code to publish commands and subscribe to telemetry.
 #[derive(Clone)]
 pub struct MqttHandle {
     client: AsyncClient,
@@ -34,6 +34,10 @@ impl MqttHandle {
             .map_err(|err| MqttEngineError::Client(err.to_string()))
     }
 
+    /// Enqueues a command into the bounded internal command queue.
+    ///
+    /// Success means the command was accepted by the local application queue only.
+    /// It does not mean the publish was accepted by the MQTT client, broker, or device
     pub fn try_enqueue_command(
         &self,
         topic: impl Into<String>,
@@ -237,6 +241,7 @@ async fn run_router_worker(
 
                 let telemetry = TelemetryEvent::from_message(&message);
 
+                // Route dispatch runs before telemetry fan-out so application handlers observe the original MQTT message first.
                 if let Err(err) = router.dispatch(message).await {
                     eprintln!("MQTT route dispatch error: {}", err);
                 }

@@ -29,13 +29,13 @@ impl<F> RawRouteHandler<F> {
 impl<F, Fut> MqttRouteHandler for F
 where
     F: Fn(MqttMessage, TopicParams) -> Fut + Send + Sync + 'static,
-    Fut: std::future::Future<Output = Result<(), MqttEngineError>> + Send + 'static,
+    Fut: Future<Output = Result<(), MqttEngineError>> + Send + 'static,
 {
     fn codec(&self) -> PayloadCodec {
         PayloadCodec::Raw
     }
     fn call(&self, message: MqttMessage, params: TopicParams) -> MqttRouteFuture {
-        Box::pin((self)(message, params))
+        Box::pin(self(message, params))
     }
 }
 
@@ -85,6 +85,11 @@ where
         }
     }
 }
+
+/// Captured MQTT wildcard values from a matched topic filter.
+///
+/// `single_level` preserves the order of `+` wildcards. `multi_level` contains the remaining
+/// levels captured by a trailing `#` wildcard, if the route uses one.
 #[derive(Debug, Clone, Default, Eq, PartialEq)]
 pub struct TopicParams {
     single_level: Vec<String>,
@@ -188,6 +193,10 @@ impl MqttRouter {
         Ok(self)
     }
 
+    /// Dispatches a message to the first matching route.
+    ///
+    /// Returns `Ok(true)` when a route handled the message and `Ok(false)` when no route matched.
+    /// Handler errors are returned immediately and stop dispatch.
     pub async fn dispatch(&self, message: MqttMessage) -> Result<bool, MqttEngineError> {
         for route in self.routes.iter() {
             if let Some(params) = route.filter.matches(message.topic()) {
@@ -232,7 +241,7 @@ struct TopicFilter {
 
 impl TopicFilter {
     fn parse(raw: String) -> Result<Self, MqttEngineError> {
-        validate_topic_filter(&raw)?;
+        validate_mqtt_topic_filter(&raw)?;
 
         let levels = raw
             .split('/')
@@ -293,7 +302,7 @@ enum TopicFilterLevel {
     MultiWildcard,
 }
 
-fn validate_topic_filter(filter: &str) -> Result<(), MqttEngineError> {
+pub(crate) fn validate_mqtt_topic_filter(filter: &str) -> Result<(), MqttEngineError> {
     if filter.is_empty() {
         return Err(MqttEngineError::InvalidTopicFilter(
             "topic filter must not be empty".to_owned(),

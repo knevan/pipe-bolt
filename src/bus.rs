@@ -72,6 +72,7 @@ pub struct InternalBusHandle {
     command_tx: mpsc::Sender<MqttCommand>,
 }
 
+/// Bounded in-process channels between MQTT polling, routing, telemetry fan-out, and command publishing.
 pub struct InternalBus {
     handle: InternalBusHandle,
     ingress_rx: mpsc::Receiver<MqttMessage>,
@@ -126,7 +127,8 @@ impl InternalBusHandle {
     }
 
     pub fn publish_telemetry(&self, event: TelemetryEvent) -> Result<usize, MqttEngineError> {
-        // Broadcast is bounded. If lagging receivers cannot keep up, Tokio drops older messages for them.
+        // Broadcast telemetry is lossy by design,
+        // slow consumers receive lag notifications instead of backpressure MQTT ingestion
         match self.telemetry_tx.send(event) {
             Ok(receiver_count) => Ok(receiver_count),
             // Returning Ok(0) because having 0 active receivers is a normal state for lossy telemetry
