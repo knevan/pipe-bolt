@@ -21,4 +21,5 @@ pub mod message;
 pub mod mqtt;
 pub mod pipeline;
 pub mod router;
+pub mod rule;
 pub mod web;

@@ -9,10 +9,9 @@ use salvo::http::cookie::time::OffsetDateTime;
 use serde_json::Value;
 use uuid::Uuid;
 
-use crate::error::MqttEngineError;
+use crate::error::{MqttEngineError, PipelineError};
 use crate::message::envelope::MqttMessage;
 use crate::router::matcher::TopicParams;
-use crate::web::realtime::error::PipelineError;
 
 #[derive(Debug, Clone)]
 pub struct NormalizationContext {
