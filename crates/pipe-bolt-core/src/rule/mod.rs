@@ -131,6 +131,8 @@ fn validate_rule(rule: &RuleDefinition, limits: RuleEngineLimits) -> Result<(), 
     }
 
     if let Some(condition) = &rule.condition {
+        validate_condition_groups(rule, condition)?;
+
         let depth = condition_depth(condition);
         if depth > limits.max_condition_depth {
             return Err(RuleError::ConditionTooDeep {
@@ -174,6 +176,44 @@ fn validate_action(
         }
         .into()),
     }
+}
+
+fn validate_condition_groups(
+    rule: &RuleDefinition,
+    condition: &ConditionExpr,
+) -> Result<(), MqttEngineError> {
+    match condition {
+        ConditionExpr::And { conditions } => {
+            if conditions.is_empty() {
+                return Err(RuleError::EmptyConditionGroup {
+                    rule_id: rule.id.to_string(),
+                    operator: "and",
+                }
+                .into());
+            }
+
+            for condition in conditions {
+                validate_condition_groups(rule, condition)?;
+            }
+        }
+        ConditionExpr::Or { conditions } => {
+            if conditions.is_empty() {
+                return Err(RuleError::EmptyConditionGroup {
+                    rule_id: rule.id.to_string(),
+                    operator: "or",
+                }
+                .into());
+            }
+
+            for condition in conditions {
+                validate_condition_groups(rule, condition)?;
+            }
+        }
+        ConditionExpr::Not { condition } => validate_condition_groups(rule, condition)?,
+        _ => {}
+    }
+
+    Ok(())
 }
 
 fn trigger_matches(trigger: &RuleTrigger, event: &NormalizedEvent) -> bool {
@@ -243,14 +283,21 @@ fn compare_numbers(
     event: &NormalizedEvent,
     compare: impl FnOnce(f64, f64) -> bool,
 ) -> Result<bool, MqttEngineError> {
-    let Some(left) = resolve_value(left, event).as_f64() else {
+    let left = resolve_optional_value(left, event);
+    let right = resolve_optional_value(right, event);
+
+    let (Some(left), Some(right)) = (left, right) else {
+        return Ok(false);
+    };
+
+    let Some(left) = left.as_f64() else {
         return Err(RuleError::NonNumericComparison {
             rule_id: rule.id.to_string(),
         }
         .into());
     };
 
-    let Some(right) = resolve_value(right, event).as_f64() else {
+    let Some(right) = right.as_f64() else {
         return Err(RuleError::NonNumericComparison {
             rule_id: rule.id.to_string(),
         }
@@ -260,10 +307,15 @@ fn compare_numbers(
     Ok(compare(left, right))
 }
 
+// Keep `resolve_value` for the equality and contains operators.
 fn resolve_value(value: &ValueExpr, event: &NormalizedEvent) -> Value {
+    resolve_optional_value(value, event).unwrap_or(Value::Null)
+}
+
+fn resolve_optional_value(value: &ValueExpr, event: &NormalizedEvent) -> Option<Value> {
     match value {
-        ValueExpr::Literal { value } => value.clone(),
-        ValueExpr::Field { field } => resolve_field(field, event).unwrap_or(Value::Null),
+        ValueExpr::Literal { value } => Some(value.clone()),
+        ValueExpr::Field { field } => resolve_field(field, event),
     }
 }
 
@@ -454,6 +506,206 @@ mod tests {
             condition,
             actions,
         }
+    }
+
+    #[test]
+    fn rejects_empty_and_group() {
+        let error = RuleEngine::new(vec![rule(
+            Some(ConditionExpr::And {
+                conditions: Vec::new(),
+            }),
+            vec![ActionIntentTemplate::StreamToUi],
+        )])
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            MqttEngineError::Rule(RuleError::EmptyConditionGroup { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_empty_or_group() {
+        let error = RuleEngine::new(vec![rule(
+            Some(ConditionExpr::Or {
+                conditions: Vec::new(),
+            }),
+            vec![ActionIntentTemplate::StreamToUi],
+        )])
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            MqttEngineError::Rule(RuleError::EmptyConditionGroup { .. })
+        ));
+    }
+
+    #[test]
+    fn missing_numeric_field_evaluates_false_without_stopping_engine() {
+        let engine = RuleEngine::new(vec![
+            rule(
+                Some(ConditionExpr::GreaterThan {
+                    left: ValueExpr::Field {
+                        field: FieldRef::Extracted {
+                            name: "missing_temperature".to_owned(),
+                        },
+                    },
+                    right: ValueExpr::Literal { value: json!(40) },
+                }),
+                vec![ActionIntentTemplate::DropEvent],
+            ),
+            rule(None, vec![ActionIntentTemplate::StreamToUi]),
+        ])
+        .unwrap();
+
+        let evaluation = engine.evaluate(&event()).unwrap();
+
+        assert_eq!(evaluation.intents.len(), 1);
+        assert!(matches!(
+            evaluation.intents[0],
+            ActionIntent::StreamToUi { .. }
+        ));
+    }
+
+    #[test]
+    fn existing_non_numeric_field_still_returns_error_for_numeric_comparison() {
+        let mut event = event();
+        event.fields.insert(
+            "temperature".to_owned(),
+            FieldValue::String("hot".to_owned()),
+        );
+
+        let engine = RuleEngine::new(vec![rule(
+            Some(ConditionExpr::GreaterThan {
+                left: ValueExpr::Field {
+                    field: FieldRef::Extracted {
+                        name: "temperature".to_owned(),
+                    },
+                },
+                right: ValueExpr::Literal { value: json!(40) },
+            }),
+            vec![ActionIntentTemplate::DropEvent],
+        )])
+        .unwrap();
+
+        let error = engine.evaluate(&event).unwrap_err();
+
+        assert!(matches!(
+            error,
+            MqttEngineError::Rule(RuleError::NonNumericComparison { .. })
+        ));
+    }
+
+    #[test]
+    fn disabled_rule_is_ignored() {
+        let mut disabled = rule(None, vec![ActionIntentTemplate::DropEvent]);
+        disabled.enabled = false;
+
+        let engine = RuleEngine::new(vec![disabled]).unwrap();
+        let evaluation = engine.evaluate(&event()).unwrap();
+
+        assert!(evaluation.intents.is_empty());
+        assert!(evaluation.matched_rules.is_empty());
+    }
+
+    #[test]
+    fn evaluates_and_or_not() {
+        let engine = RuleEngine::new(vec![rule(
+            Some(ConditionExpr::And {
+                conditions: vec![
+                    ConditionExpr::Exists {
+                        field: FieldRef::DeviceId,
+                    },
+                    ConditionExpr::Or {
+                        conditions: vec![
+                            ConditionExpr::Equals {
+                                left: ValueExpr::Field {
+                                    field: FieldRef::EventType,
+                                },
+                                right: ValueExpr::Literal {
+                                    value: json!("status"),
+                                },
+                            },
+                            ConditionExpr::Not {
+                                condition: Box::new(ConditionExpr::Equals {
+                                    left: ValueExpr::Field {
+                                        field: FieldRef::Topic,
+                                    },
+                                    right: ValueExpr::Literal {
+                                        value: json!("blocked"),
+                                    },
+                                }),
+                            },
+                        ],
+                    },
+                ],
+            }),
+            vec![ActionIntentTemplate::StreamToUi],
+        )])
+        .unwrap();
+
+        let evaluation = engine.evaluate(&event()).unwrap();
+
+        assert_eq!(evaluation.intents.len(), 1);
+    }
+
+    #[test]
+    fn condition_depth_limit_is_enforced() {
+        let condition = ConditionExpr::Not {
+            condition: Box::new(ConditionExpr::Not {
+                condition: Box::new(ConditionExpr::Exists {
+                    field: FieldRef::DeviceId,
+                }),
+            }),
+        };
+
+        let error = RuleEngine::with_limits(
+            vec![rule(
+                Some(condition),
+                vec![ActionIntentTemplate::StreamToUi],
+            )],
+            RuleEngineLimits {
+                max_condition_depth: 1,
+                max_condition_nodes: 256,
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            MqttEngineError::Rule(RuleError::ConditionTooDeep { .. })
+        ));
+    }
+
+    #[test]
+    fn condition_node_limit_is_enforced() {
+        let condition = ConditionExpr::And {
+            conditions: vec![
+                ConditionExpr::Exists {
+                    field: FieldRef::DeviceId,
+                },
+                ConditionExpr::Exists {
+                    field: FieldRef::EventType,
+                },
+            ],
+        };
+
+        let error = RuleEngine::with_limits(
+            vec![rule(
+                Some(condition),
+                vec![ActionIntentTemplate::StreamToUi],
+            )],
+            RuleEngineLimits {
+                max_condition_depth: 16,
+                max_condition_nodes: 2,
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            MqttEngineError::Rule(RuleError::ConditionTooLarge { .. })
+        ));
     }
 
     #[test]

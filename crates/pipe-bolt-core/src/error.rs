@@ -139,6 +139,12 @@ pub enum RuleError {
         max: usize,
     },
 
+    #[error("rule '{rule_id}' condition group '{operator}' must not be empty")]
+    EmptyConditionGroup {
+        rule_id: String,
+        operator: &'static str,
+    },
+
     #[error("rule '{rule_id}' comparison requires numeric values")]
     NonNumericComparison { rule_id: String },
 
