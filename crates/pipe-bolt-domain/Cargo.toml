@@ -1,0 +1,15 @@
+[package]
+name = "pipe-bolt-domain"
+version = "0.1.0"
+edition = "2024"
+resolver = "3"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+serde_bytes = "0.11.19"
+thiserror = "2.0.17"
+time = { version = "0.3.44", features = ["formatting", "parsing", "serde", "serde-well-known"] }

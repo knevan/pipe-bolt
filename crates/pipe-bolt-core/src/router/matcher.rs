@@ -117,11 +117,11 @@ impl TopicParams {
         }
     }
 
-    fn push_single(&mut self, value: &str) {
+    pub(crate) fn push_single(&mut self, value: &str) {
         self.single_level.push(value.to_owned());
     }
 
-    fn set_multi<I>(&mut self, values: I)
+    pub(crate) fn set_multi<I>(&mut self, values: I)
     where
         I: IntoIterator,
         I::Item: Into<String>,
@@ -302,7 +302,7 @@ enum TopicFilterLevel {
     MultiWildcard,
 }
 
-pub(crate) fn validate_mqtt_topic_filter(filter: &str) -> Result<(), MqttEngineError> {
+pub fn validate_mqtt_topic_filter(filter: &str) -> Result<(), MqttEngineError> {
     if filter.is_empty() {
         return Err(MqttEngineError::InvalidTopicFilter(
             "topic filter must not be empty".to_owned(),

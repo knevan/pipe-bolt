@@ -57,27 +57,27 @@ impl RealtimeBridgeState {
         self
     }
 
-    pub(crate) fn websocket_client_buffer(&self) -> usize {
+    pub fn websocket_client_buffer(&self) -> usize {
         self.websocket_client_buffer
     }
 
-    pub(crate) fn websocket_ping_interval(&self) -> Duration {
+    pub fn websocket_ping_interval(&self) -> Duration {
         self.websocket_ping_interval
     }
 
-    pub(crate) fn websocket_send_timeout(&self) -> Duration {
+    pub fn websocket_send_timeout(&self) -> Duration {
         self.websocket_send_timeout
     }
 
-    pub(crate) fn sse_keep_alive_interval(&self) -> Duration {
+    pub fn sse_keep_alive_interval(&self) -> Duration {
         self.sse_keep_alive_interval
     }
 
-    pub(crate) fn subscribe_telemetry(&self) -> tokio::sync::broadcast::Receiver<TelemetryEvent> {
+    pub fn subscribe_telemetry(&self) -> tokio::sync::broadcast::Receiver<TelemetryEvent> {
         self.mqtt.subscribe_telemetry()
     }
 
-    pub(crate) fn enqueue_command(
+    pub fn enqueue_command(
         &self,
         request: CommandRequest,
     ) -> Result<CommandQueueReceipt, CommandEndpointError> {

@@ -1,14 +1,14 @@
 use std::time::Duration;
 
 /// Small exponential backoff helper for reconnect throttling.
-pub(crate) struct ExponentialBackoff {
+pub struct ExponentialBackoff {
     min_delay: Duration,
     max_delay: Duration,
     current_delay: Duration,
 }
 
 impl ExponentialBackoff {
-    pub(crate) fn new(min_delay: Duration, max_delay: Duration) -> Self {
+    pub fn new(min_delay: Duration, max_delay: Duration) -> Self {
         Self {
             min_delay,
             max_delay,
@@ -16,11 +16,11 @@ impl ExponentialBackoff {
         }
     }
 
-    pub(crate) fn reset(&mut self) {
+    pub fn reset(&mut self) {
         self.current_delay = self.min_delay
     }
 
-    pub(crate) fn next_delay(&mut self) -> Duration {
+    pub fn next_delay(&mut self) -> Duration {
         let delay = self.current_delay;
         self.current_delay = self.current_delay.saturating_mul(2).min(self.max_delay);
         delay

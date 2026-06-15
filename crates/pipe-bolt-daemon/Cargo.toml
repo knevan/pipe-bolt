@@ -1,0 +1,14 @@
+[package]
+name = "pipe-bolt-daemon"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "pipe-bolt-daemon"
+path = "src/main.rs"
+
+[dependencies]
+pipe-bolt-core = { path = "../pipe-bolt-core" }
+
+tokio = { version = "1.52.3", features = ["full"] }
+rumqttc = "0.25.1"

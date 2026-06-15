@@ -18,7 +18,7 @@ pub struct TelemetryPayload {
 }
 
 impl TelemetryPayload {
-    pub(crate) fn from_event(event: TelemetryEvent) -> Self {
+    pub fn from_event(event: TelemetryEvent) -> Self {
         let device = telemetry_device(&event.topic).map(str::to_owned);
         let event_type = telemetry_event_type(&event.topic).map(str::to_owned);
         let payload_utf8 = String::from_utf8(event.payload.clone()).ok();
@@ -55,7 +55,7 @@ impl From<&TelemetryFilter> for TelemetryFilterSnapshot {
 
 #[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-pub(crate) enum BridgeServerMessage {
+pub enum BridgeServerMessage {
     Ready {
         transport: &'static str,
         filter: TelemetryFilterSnapshot,
@@ -79,7 +79,7 @@ pub(crate) enum BridgeServerMessage {
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
-pub(crate) enum BridgeClientMessage {
+pub enum BridgeClientMessage {
     Subscribe {
         device: Option<String>,
         topic: Option<String>,

@@ -12,7 +12,7 @@ pub struct TelemetryFilter {
 }
 
 impl TelemetryFilter {
-    pub(crate) fn normalized(self) -> Self {
+    pub fn normalized(self) -> Self {
         Self {
             device: normalize_optional(self.device),
             topic: normalize_optional(self.topic),
@@ -24,7 +24,7 @@ impl TelemetryFilter {
     /// Matches telemetry events using exact values and segment-aware prefixes only.
     ///
     /// This intentionally does not support MQTT wildcards from client input.
-    pub(crate) fn matches(&self, event: &TelemetryEvent) -> bool {
+    pub fn matches(&self, event: &TelemetryEvent) -> bool {
         if let Some(expected) = self.device.as_deref()
             && telemetry_device(&event.topic) != Some(expected)
         {
@@ -53,7 +53,7 @@ impl TelemetryFilter {
     }
 }
 
-pub(crate) fn parse_filter(req: &mut Request) -> Result<TelemetryFilter, StatusError> {
+pub fn parse_filter(req: &mut Request) -> Result<TelemetryFilter, StatusError> {
     let filter = TelemetryFilter {
         device: req.query::<String>("device"),
         topic: req.query::<String>("topic"),
@@ -65,7 +65,7 @@ pub(crate) fn parse_filter(req: &mut Request) -> Result<TelemetryFilter, StatusE
     Ok(filter)
 }
 
-pub(crate) fn topic_matches_prefix(topic: &str, prefix: &str) -> bool {
+pub fn topic_matches_prefix(topic: &str, prefix: &str) -> bool {
     // Use segment-aware prefix matching to avoid matching `devices/a` against `devices/abc`.
     topic == prefix
         || topic
@@ -73,7 +73,7 @@ pub(crate) fn topic_matches_prefix(topic: &str, prefix: &str) -> bool {
             .is_some_and(|rest| rest.starts_with('/'))
 }
 
-pub(crate) fn telemetry_device(topic: &str) -> Option<&str> {
+pub fn telemetry_device(topic: &str) -> Option<&str> {
     let mut levels = topic.split('/');
     let namespace = levels.next()?;
 
@@ -84,7 +84,7 @@ pub(crate) fn telemetry_device(topic: &str) -> Option<&str> {
     }
 }
 
-pub(crate) fn telemetry_event_type(topic: &str) -> Option<&str> {
+pub fn telemetry_event_type(topic: &str) -> Option<&str> {
     let levels: Vec<&str> = topic.split('/').collect();
 
     match levels.as_slice() {

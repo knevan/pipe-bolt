@@ -4,7 +4,7 @@ use crate::command::CommandRequest;
 use crate::web::realtime::state::RealtimeBridgeState;
 
 #[handler]
-pub(crate) async fn command_http(
+pub async fn command_http(
     req: &mut Request,
     depot: &mut Depot,
     res: &mut Response,

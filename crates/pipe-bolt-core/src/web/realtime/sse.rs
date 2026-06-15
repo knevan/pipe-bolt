@@ -10,7 +10,7 @@ use crate::web::realtime::filter::parse_filter;
 use crate::web::realtime::state::RealtimeBridgeState;
 
 #[handler]
-pub(crate) async fn telemetry_sse(
+pub async fn telemetry_sse(
     req: &mut Request,
     depot: &mut Depot,
     res: &mut Response,

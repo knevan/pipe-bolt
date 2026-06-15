@@ -16,7 +16,7 @@ const WEBSOCKET_MAX_MESSAGE_SIZE: usize = 63 * 1024;
 const WEBSOCKET_MAX_FRAME_SIZE: usize = 63 * 1024;
 
 #[handler]
-pub(crate) async fn telemetry_ws(
+pub async fn telemetry_ws(
     req: &mut Request,
     depot: &mut Depot,
     res: &mut Response,
