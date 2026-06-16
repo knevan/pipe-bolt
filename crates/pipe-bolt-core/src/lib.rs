@@ -16,6 +16,7 @@ pub mod bus;
 pub mod codec;
 pub mod command;
 pub mod config;
+pub mod dispatcher;
 pub mod error;
 pub mod message;
 pub mod mqtt;

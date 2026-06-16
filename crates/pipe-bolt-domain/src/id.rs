@@ -1,4 +1,4 @@
-﻿use std::borrow::Cow;
+﻿// use std::borrow::Cow;
 use std::fmt;
 use std::str::FromStr;
 
@@ -184,6 +184,6 @@ pub(crate) fn validate_field_path(path: &str) -> Result<(), DomainError> {
     Ok(())
 }
 
-pub(crate) fn borrowed_or_owned<'a>(value: &'a str) -> Cow<'a, str> {
-    Cow::Borrowed(value)
-}
+// pub(crate) fn borrowed_or_owned<'a>(value: &'a str) -> Cow<'a, str> {
+//     Cow::Borrowed(value)
+// }

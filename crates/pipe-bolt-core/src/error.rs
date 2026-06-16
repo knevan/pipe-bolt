@@ -17,6 +17,7 @@ pub enum MqttEngineError {
     Pipeline(PipelineError),
     Domain(String),
     Rule(RuleError),
+    Dispatch(DispatchError),
     IngressClosed,
     IngressQueueFull,
     TelemetryClosed,
@@ -39,6 +40,7 @@ impl Display for MqttEngineError {
             Self::Pipeline(error) => write!(f, "pipeline error: {error}"),
             Self::Domain(message) => write!(f, "domain error: {message}"),
             Self::Rule(error) => write!(f, "rule error: {error}"),
+            Self::Dispatch(error) => write!(f, "dispatch error: {error}"),
             Self::IngressClosed => write!(f, "ingress queue is closed"),
             Self::IngressQueueFull => write!(f, "ingress queue is full"),
             Self::TelemetryClosed => write!(f, "telemetry broadcast channel is closed"),
@@ -56,15 +58,22 @@ impl From<PipelineError> for MqttEngineError {
     }
 }
 
-impl From<DomainError> for MqttEngineError {
-    fn from(error: DomainError) -> Self {
-        Self::Domain(error.to_string())
+impl From<DispatchError> for MqttEngineError {
+    fn from(error: DispatchError) -> Self {
+        Self::Dispatch(error)
     }
 }
 
 impl From<RuleError> for MqttEngineError {
     fn from(error: RuleError) -> Self {
         Self::Rule(error)
+    }
+}
+
+/// Impl DomainError from pipe-bolt-domain module
+impl From<DomainError> for MqttEngineError {
+    fn from(error: DomainError) -> Self {
+        Self::Domain(error.to_string())
     }
 }
 
@@ -106,6 +115,21 @@ pub enum PipelineError {
 
     #[error("payload field device_id extraction requires JSON payload")]
     DeviceIdRequiresJson,
+}
+
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+pub enum DispatchError {
+    #[error("realtime stream is unavailable")]
+    RealtimeUnavailable,
+
+    #[error("realtime stream is full")]
+    RealtimeBackpressure,
+
+    #[error("metadata key is invalid: {reason}")]
+    InvalidMetadataKey { reason: &'static str },
+
+    #[error("metadata value is too large: {actual} exceeds {max} bytes")]
+    MetadataValueTooLarge { actual: usize, max: usize },
 }
 
 #[derive(Debug, Error, Clone, Eq, PartialEq)]
@@ -150,4 +174,24 @@ pub enum RuleError {
 
     #[error("rule '{rule_id}' value source is not available")]
     MissingValue { rule_id: String },
+
+    #[error("rule '{rule_id}' has too many actions: {actual} exceeds {max}")]
+    TooManyActions {
+        rule_id: String,
+        actual: usize,
+        max: usize,
+    },
+
+    #[error("rule '{rule_id}' metadata key is invalid: {reason}")]
+    InvalidMetadataKey {
+        rule_id: String,
+        reason: &'static str,
+    },
+
+    #[error("rule '{rule_id}' metadata value is too large: {actual} exceeds {max} bytes")]
+    MetadataValueTooLarge {
+        rule_id: String,
+        actual: usize,
+        max: usize,
+    },
 }
