@@ -119,6 +119,15 @@ pub enum PipelineError {
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum DispatchError {
+    #[error("invalid dispatch config: {reason}")]
+    InvalidConfig { reason: &'static str },
+
+    #[error("too many action intents for one event: {actual} exceeds {max}")]
+    TooManyIntents { actual: usize, max: usize },
+
+    #[error("too many metadata entries for one event: {actual} exceeds {max}")]
+    TooManyMetadataEntries { actual: usize, max: usize },
+
     #[error("realtime stream is unavailable")]
     RealtimeUnavailable,
 

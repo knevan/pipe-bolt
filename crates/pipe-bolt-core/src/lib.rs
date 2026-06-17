@@ -12,6 +12,7 @@
     // clippy::missing_const_for_fn,
 )]
 
+pub mod action_metadata;
 pub mod bus;
 pub mod codec;
 pub mod command;

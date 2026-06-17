@@ -6,15 +6,30 @@ use pipe_bolt_domain::{
 };
 use serde_json::{Number, Value};
 
+use crate::action_metadata::{
+    ActionMetadataLimits, MetadataValidationError, validate_action_metadata,
+};
 use crate::error::{MqttEngineError, RuleError};
 
 const DEFAULT_MAX_CONDITION_DEPTH: usize = 16;
 const DEFAULT_MAX_CONDITION_NODES: usize = 256;
+const DEFAULT_MAX_ACTIONS_PER_RULE: usize = 16;
+const DEFAULT_MAX_METADATA_KEY_BYTES: usize = 128;
+const DEFAULT_MAX_METADATA_VALUE_BYTES: usize = 1024;
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub struct RuleEngineLimits {
     pub max_condition_depth: usize,
     pub max_condition_nodes: usize,
+    pub max_actions_per_rule: usize,
+    pub max_metadata_key_bytes: usize,
+    pub max_metadata_value_bytes: usize,
+}
+
+impl RuleEngineLimits {
+    fn metadata_limits(self) -> ActionMetadataLimits {
+        ActionMetadataLimits::new(self.max_metadata_key_bytes, self.max_metadata_value_bytes)
+    }
 }
 
 impl Default for RuleEngineLimits {
@@ -22,6 +37,9 @@ impl Default for RuleEngineLimits {
         Self {
             max_condition_depth: DEFAULT_MAX_CONDITION_DEPTH,
             max_condition_nodes: DEFAULT_MAX_CONDITION_NODES,
+            max_actions_per_rule: DEFAULT_MAX_ACTIONS_PER_RULE,
+            max_metadata_key_bytes: DEFAULT_MAX_METADATA_KEY_BYTES,
+            max_metadata_value_bytes: DEFAULT_MAX_METADATA_VALUE_BYTES,
         }
     }
 }
@@ -126,8 +144,17 @@ fn validate_rule(rule: &RuleDefinition, limits: RuleEngineLimits) -> Result<(), 
         .into());
     }
 
+    if rule.actions.len() > limits.max_actions_per_rule {
+        return Err(RuleError::TooManyActions {
+            rule_id: rule.id.to_string(),
+            actual: rule.actions.len(),
+            max: limits.max_actions_per_rule,
+        }
+        .into());
+    }
+
     for action in &rule.actions {
-        validate_action(rule, action)?;
+        validate_action(rule, action, limits)?;
     }
 
     if let Some(condition) = &rule.condition {
@@ -160,11 +187,13 @@ fn validate_rule(rule: &RuleDefinition, limits: RuleEngineLimits) -> Result<(), 
 fn validate_action(
     rule: &RuleDefinition,
     action: &ActionIntentTemplate,
+    limits: RuleEngineLimits,
 ) -> Result<(), MqttEngineError> {
     match action {
-        ActionIntentTemplate::StreamToUi
-        | ActionIntentTemplate::DropEvent
-        | ActionIntentTemplate::AddMetadata { .. } => Ok(()),
+        ActionIntentTemplate::StreamToUi | ActionIntentTemplate::DropEvent => Ok(()),
+        ActionIntentTemplate::AddMetadata { key, value } => {
+            validate_metadata_action(rule, key, value, limits)
+        }
         ActionIntentTemplate::ForwardToSink { .. } => Err(RuleError::UnsupportedAction {
             rule_id: rule.id.to_string(),
             action: "forward_to_sink",
@@ -176,6 +205,31 @@ fn validate_action(
         }
         .into()),
     }
+}
+
+fn validate_metadata_action(
+    rule: &RuleDefinition,
+    key: &str,
+    value: &str,
+    limits: RuleEngineLimits,
+) -> Result<(), MqttEngineError> {
+    validate_action_metadata(key, value, limits.metadata_limits()).map_err(
+        |error| match error {
+            MetadataValidationError::InvalidKey { reason } => RuleError::InvalidMetadataKey {
+                rule_id: rule.id.to_string(),
+                reason,
+            },
+            MetadataValidationError::ValueTooLarge { actual, max } => {
+                RuleError::MetadataValueTooLarge {
+                    rule_id: rule.id.to_string(),
+                    actual,
+                    max,
+                }
+            }
+        },
+    )?;
+
+    Ok(())
 }
 
 fn validate_condition_groups(
@@ -666,7 +720,10 @@ mod tests {
             )],
             RuleEngineLimits {
                 max_condition_depth: 1,
-                max_condition_nodes: 256,
+                max_condition_nodes: 2,
+                max_actions_per_rule: 16,
+                max_metadata_key_bytes: 128,
+                max_metadata_value_bytes: 1024,
             },
         )
         .unwrap_err();
@@ -698,6 +755,9 @@ mod tests {
             RuleEngineLimits {
                 max_condition_depth: 16,
                 max_condition_nodes: 2,
+                max_actions_per_rule: 16,
+                max_metadata_key_bytes: 128,
+                max_metadata_value_bytes: 2,
             },
         )
         .unwrap_err();
@@ -807,6 +867,89 @@ mod tests {
         assert!(matches!(
             evaluation.intents[0],
             ActionIntent::DropEvent { .. }
+        ));
+    }
+
+    #[test]
+    fn route_matched_trigger_matches_same_route_id() {
+        let mut route_rule = rule(None, vec![ActionIntentTemplate::StreamToUi]);
+        route_rule.trigger = RuleTrigger::RouteMatched {
+            route_id: RouteId::new("route-1").unwrap(),
+        };
+
+        let engine = RuleEngine::new(vec![route_rule]).unwrap();
+        let evaluation = engine.evaluate(&event()).unwrap();
+
+        assert_eq!(evaluation.intents.len(), 1);
+        assert_eq!(evaluation.matched_rules.len(), 1);
+    }
+
+    #[test]
+    fn rejects_too_many_actions_per_rule() {
+        let error = RuleEngine::with_limits(
+            vec![rule(
+                None,
+                vec![
+                    ActionIntentTemplate::StreamToUi,
+                    ActionIntentTemplate::DropEvent,
+                ],
+            )],
+            RuleEngineLimits {
+                max_condition_depth: 16,
+                max_condition_nodes: 2,
+                max_actions_per_rule: 1,
+                max_metadata_key_bytes: 128,
+                max_metadata_value_bytes: 1024,
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            MqttEngineError::Rule(RuleError::TooManyActions { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_invalid_add_metadata_key() {
+        let error = RuleEngine::new(vec![rule(
+            None,
+            vec![ActionIntentTemplate::AddMetadata {
+                key: "pipe_bolt.internal".to_owned(),
+                value: "blocked".to_owned(),
+            }],
+        )])
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            MqttEngineError::Rule(RuleError::InvalidMetadataKey { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_add_metadata_value_that_exceeds_limit() {
+        let error = RuleEngine::with_limits(
+            vec![rule(
+                None,
+                vec![ActionIntentTemplate::AddMetadata {
+                    key: "severity".to_owned(),
+                    value: "hot".to_owned(),
+                }],
+            )],
+            RuleEngineLimits {
+                max_condition_depth: 16,
+                max_condition_nodes: 2,
+                max_actions_per_rule: 16,
+                max_metadata_key_bytes: 128,
+                max_metadata_value_bytes: 2,
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            MqttEngineError::Rule(RuleError::MetadataValueTooLarge { .. })
         ));
     }
 }

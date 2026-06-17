@@ -3,21 +3,36 @@
 use pipe_bolt_domain::{ActionIntent, EventId, NormalizedEvent};
 use tokio::sync::mpsc;
 
+use crate::action_metadata::{
+    ActionMetadataLimits, MetadataValidationError, validate_action_metadata,
+};
 use crate::error::DispatchError;
 
+const DEFAULT_MAX_INTENTS_PER_EVENT: usize = 128;
+const DEFAULT_MAX_METADATA_ENTRIES_PER_EVENT: usize = 32;
 const DEFAULT_MAX_METADATA_KEY_BYTES: usize = 128;
 const DEFAULT_MAX_METADATA_VALUE_BYTES: usize = 1024;
-const RESERVED_METADATA_PREFIXES: [&str; 2] = ["pipe_bolt.", "_pipe_bolt."];
 
+/// Runtime limits for dispatch work performed for one event.
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub struct DispatchLimits {
+    pub max_intents_per_event: usize,
+    pub max_metadata_entries_per_event: usize,
     pub max_metadata_key_bytes: usize,
     pub max_metadata_value_bytes: usize,
+}
+
+impl DispatchLimits {
+    fn metadata_limits(self) -> ActionMetadataLimits {
+        ActionMetadataLimits::new(self.max_metadata_key_bytes, self.max_metadata_value_bytes)
+    }
 }
 
 impl Default for DispatchLimits {
     fn default() -> Self {
         Self {
+            max_intents_per_event: DEFAULT_MAX_INTENTS_PER_EVENT,
+            max_metadata_entries_per_event: DEFAULT_MAX_METADATA_ENTRIES_PER_EVENT,
             max_metadata_key_bytes: DEFAULT_MAX_METADATA_KEY_BYTES,
             max_metadata_value_bytes: DEFAULT_MAX_METADATA_VALUE_BYTES,
         }
@@ -32,14 +47,7 @@ pub struct DispatchOutcome {
     pub skipped: Vec<SkippedAction>,
     pub failed: Vec<FailedAction>,
     pub dropped: bool,
-}
-
-/// Action that was accepted and executed by the dispatcher.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ExecutedAction {
-    StreamToUi { receiver_count: usize },
-    AddMetadata { key: String },
-    DropEvent,
+    pub metadata_overlay: BTreeMap<String, String>,
 }
 
 impl DispatchOutcome {
@@ -50,8 +58,28 @@ impl DispatchOutcome {
             skipped: Vec::new(),
             failed: Vec::new(),
             dropped: false,
+            metadata_overlay: BTreeMap::new(),
         }
     }
+
+    /// Builds an enriched event snapshot by applying the dispatch metadata overlay.
+    pub fn enriched_event(&self, original: &NormalizedEvent) -> NormalizedEvent {
+        if self.metadata_overlay.is_empty() {
+            return original.clone();
+        }
+
+        let mut event = original.clone();
+        event.metadata.extend(self.metadata_overlay.clone());
+        event
+    }
+}
+
+/// Action that was accepted and executed by the dispatcher.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExecutedAction {
+    StreamToUi { receipt: RealtimePublishReceipt },
+    AddMetadata { key: String },
+    DropEvent,
 }
 
 /// Action that was not executed because dispatcher semantics skipped it.
@@ -76,6 +104,12 @@ pub struct FailedAction {
     pub error: DispatchError,
 }
 
+/// Result returned by a bounded realtime publish boundary.
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub struct RealtimePublishReceipt {
+    pub accepted: bool,
+}
+
 /// Bounded realtime event sink used by StreamToUi dispatch.
 #[derive(Clone)]
 pub struct BoundedRealtimeEventSink {
@@ -83,25 +117,34 @@ pub struct BoundedRealtimeEventSink {
 }
 
 impl BoundedRealtimeEventSink {
-    pub fn channel(capacity: usize) -> (Self, mpsc::Receiver<NormalizedEvent>) {
-        let (tx, rx) = mpsc::channel(capacity.max(1));
-        (Self { tx }, rx)
+    /// Creates a bounded realtime event sink with explicit capacity validation.
+    pub fn try_channel(
+        capacity: usize,
+    ) -> Result<(Self, mpsc::Receiver<NormalizedEvent>), DispatchError> {
+        if capacity == 0 {
+            return Err(DispatchError::InvalidConfig {
+                reason: "realtime sink capacity must be greater than zero",
+            });
+        }
+
+        let (tx, rx) = mpsc::channel(capacity);
+        Ok((Self { tx }, rx))
     }
 }
 
-/// Minimal side effect boundary required by the dispatcher.
-pub trait RealtimeEventSink: Clone + Send + Sync + 'static {
-    fn try_publish(&self, event: NormalizedEvent) -> Result<usize, DispatchError>;
+/// Minimal side-effect boundary required by the dispatcher.
+pub trait RealtimeEventSink {
+    fn try_publish(&self, event: NormalizedEvent) -> Result<RealtimePublishReceipt, DispatchError>;
 }
 
 impl RealtimeEventSink for BoundedRealtimeEventSink {
-    fn try_publish(&self, event: NormalizedEvent) -> Result<usize, DispatchError> {
+    fn try_publish(&self, event: NormalizedEvent) -> Result<RealtimePublishReceipt, DispatchError> {
         self.tx.try_send(event).map_err(|error| match error {
             mpsc::error::TrySendError::Full(_) => DispatchError::RealtimeBackpressure,
             mpsc::error::TrySendError::Closed(_) => DispatchError::RealtimeUnavailable,
         })?;
 
-        Ok(1)
+        Ok(RealtimePublishReceipt { accepted: true })
     }
 }
 
@@ -124,7 +167,18 @@ where
         Self { realtime, limits }
     }
 
-    pub fn dispatch(&self, event: &NormalizedEvent, intents: &[ActionIntent]) -> DispatchOutcome {
+    pub fn dispatch(
+        &self,
+        event: &NormalizedEvent,
+        intents: &[ActionIntent],
+    ) -> Result<DispatchOutcome, DispatchError> {
+        if intents.len() > self.limits.max_intents_per_event {
+            return Err(DispatchError::TooManyIntents {
+                actual: intents.len(),
+                max: self.limits.max_intents_per_event,
+            });
+        }
+
         let mut outcome = DispatchOutcome::new(event.id.clone());
         let mut context = EventDispatchContext::new(event);
 
@@ -152,9 +206,9 @@ where
                 ActionIntent::StreamToUi { .. } => {
                     let enriched = context.enriched_event();
                     match self.realtime.try_publish(enriched) {
-                        Ok(receiver_count) => outcome
+                        Ok(receipt) => outcome
                             .executed
-                            .push(ExecutedAction::StreamToUi { receiver_count }),
+                            .push(ExecutedAction::StreamToUi { receipt }),
                         Err(error) => outcome.failed.push(FailedAction { action_type, error }),
                     }
                 }
@@ -163,20 +217,17 @@ where
                     outcome.executed.push(ExecutedAction::DropEvent);
                 }
                 ActionIntent::AddMetadata { key, value, .. } => {
-                    match validate_metadata(key, value, self.limits) {
-                        Ok(()) => {
-                            context.insert_metadata(key.clone(), value.clone());
-                            outcome
-                                .executed
-                                .push(ExecutedAction::AddMetadata { key: key.clone() });
-                        }
+                    match context.insert_metadata(key, value, self.limits) {
+                        Ok(()) => outcome
+                            .executed
+                            .push(ExecutedAction::AddMetadata { key: key.clone() }),
                         Err(error) => outcome.failed.push(FailedAction { action_type, error }),
                     }
                 }
                 ActionIntent::ForwardToSink { .. } => {
                     outcome.skipped.push(SkippedAction::Unsupported {
                         action_type: "forward_to_sink",
-                    })
+                    });
                 }
                 ActionIntent::PublishMqttCommand { .. } => {
                     outcome.skipped.push(SkippedAction::Unsupported {
@@ -186,7 +237,8 @@ where
             }
         }
 
-        outcome
+        outcome.metadata_overlay = context.into_metadata_overlay();
+        Ok(outcome)
     }
 }
 
@@ -203,8 +255,26 @@ impl<'a> EventDispatchContext<'a> {
         }
     }
 
-    fn insert_metadata(&mut self, key: String, value: String) {
-        self.metadata_overlay.insert(key, value);
+    fn insert_metadata(
+        &mut self,
+        key: &str,
+        value: &str,
+        limits: DispatchLimits,
+    ) -> Result<(), DispatchError> {
+        validate_metadata(key, value, limits)?;
+
+        if !self.metadata_overlay.contains_key(key)
+            && self.metadata_overlay.len() >= limits.max_metadata_entries_per_event
+        {
+            return Err(DispatchError::TooManyMetadataEntries {
+                actual: self.metadata_overlay.len() + 1,
+                max: limits.max_metadata_entries_per_event,
+            });
+        }
+
+        self.metadata_overlay
+            .insert(key.to_owned(), value.to_owned());
+        Ok(())
     }
 
     fn enriched_event(&self) -> NormalizedEvent {
@@ -216,6 +286,10 @@ impl<'a> EventDispatchContext<'a> {
         event.metadata.extend(self.metadata_overlay.clone());
         event
     }
+
+    fn into_metadata_overlay(self) -> BTreeMap<String, String> {
+        self.metadata_overlay
+    }
 }
 
 pub(crate) fn validate_metadata(
@@ -223,41 +297,14 @@ pub(crate) fn validate_metadata(
     value: &str,
     limits: DispatchLimits,
 ) -> Result<(), DispatchError> {
-    if key.is_empty() {
-        return Err(DispatchError::InvalidMetadataKey {
-            reason: "key must not be empty",
-        });
-    }
-
-    if key.len() > limits.max_metadata_key_bytes {
-        return Err(DispatchError::InvalidMetadataKey {
-            reason: "key exceeds maximum length",
-        });
-    }
-
-    if key.bytes().any(|byte| byte.is_ascii_control()) {
-        return Err(DispatchError::InvalidMetadataKey {
-            reason: "key must not contain control characters",
-        });
-    }
-
-    if RESERVED_METADATA_PREFIXES
-        .iter()
-        .any(|prefix| key.starts_with(prefix))
-    {
-        return Err(DispatchError::InvalidMetadataKey {
-            reason: "key uses reserved prefix",
-        });
-    }
-
-    if value.len() > limits.max_metadata_value_bytes {
-        return Err(DispatchError::MetadataValueTooLarge {
-            actual: value.len(),
-            max: limits.max_metadata_value_bytes,
-        });
-    }
-
-    Ok(())
+    validate_action_metadata(key, value, limits.metadata_limits()).map_err(|error| match error {
+        MetadataValidationError::InvalidKey { reason } => {
+            DispatchError::InvalidMetadataKey { reason }
+        }
+        MetadataValidationError::ValueTooLarge { actual, max } => {
+            DispatchError::MetadataValueTooLarge { actual, max }
+        }
+    })
 }
 
 fn intent_event_id(intent: &ActionIntent) -> Option<&EventId> {
@@ -285,13 +332,22 @@ mod tests {
     use std::collections::BTreeMap;
 
     use pipe_bolt_domain::{
-        ActionIntent, BrokerId, DecodedPayload, EventId, ProjectId, RouteId, TopicName,
+        ActionIntent, ActionIntentTemplate, BrokerId, DecodedPayload, EventId, FieldValue,
+        ProjectId, RouteId, RuleDefinition, RuleId, RuleTrigger, TopicName,
     };
+    use serde_json::json;
     use time::OffsetDateTime;
 
     use super::*;
+    use crate::rule::rules::RuleEngine;
 
     fn event() -> NormalizedEvent {
+        let mut fields = BTreeMap::new();
+        fields.insert(
+            "temperature".to_owned(),
+            FieldValue::Number(serde_json::Number::from(42)),
+        );
+
         NormalizedEvent {
             id: EventId::new("evt-test").unwrap(),
             correlation_id: "evt-test".to_owned(),
@@ -304,36 +360,49 @@ mod tests {
             event_type: "telemetry".to_owned(),
             received_at: OffsetDateTime::UNIX_EPOCH,
             payload_size_bytes: 16,
-            payload: DecodedPayload::Json(serde_json::json!({ "temperature": 42 })),
-            fields: BTreeMap::new(),
+            payload: DecodedPayload::Json(json!({ "temperature": 42 })),
+            fields,
             raw: None,
             normalization_errors: Vec::new(),
             metadata: BTreeMap::new(),
         }
     }
 
+    fn dispatcher() -> (
+        ActionDispatcher<BoundedRealtimeEventSink>,
+        mpsc::Receiver<NormalizedEvent>,
+    ) {
+        let (sink, rx) = BoundedRealtimeEventSink::try_channel(1).unwrap();
+        (ActionDispatcher::new(sink), rx)
+    }
+
     #[tokio::test]
     async fn stream_to_ui_sends_enriched_snapshot_without_mutating_original_event() {
-        let (sink, mut rx) = BoundedRealtimeEventSink::channel(1);
-        let dispatcher = ActionDispatcher::new(sink);
+        let (dispatcher, mut rx) = dispatcher();
         let event = event();
 
-        let outcome = dispatcher.dispatch(
-            &event,
-            &[
-                ActionIntent::AddMetadata {
-                    event_id: event.id.clone(),
-                    key: "severity".to_owned(),
-                    value: "hot".to_owned(),
-                },
-                ActionIntent::StreamToUi {
-                    event_id: event.id.clone(),
-                },
-            ],
-        );
+        let outcome = dispatcher
+            .dispatch(
+                &event,
+                &[
+                    ActionIntent::AddMetadata {
+                        event_id: event.id.clone(),
+                        key: "severity".to_owned(),
+                        value: "hot".to_owned(),
+                    },
+                    ActionIntent::StreamToUi {
+                        event_id: event.id.clone(),
+                    },
+                ],
+            )
+            .unwrap();
 
         assert!(outcome.failed.is_empty());
         assert_eq!(outcome.executed.len(), 2);
+        assert_eq!(
+            outcome.metadata_overlay.get("severity").map(String::as_str),
+            Some("hot")
+        );
         assert!(event.metadata.is_empty());
 
         let streamed = rx.recv().await.unwrap();
@@ -344,23 +413,49 @@ mod tests {
     }
 
     #[test]
-    fn drop_event_stops_remaining_actions() {
-        let (sink, _rx) = BoundedRealtimeEventSink::channel(1);
-        let dispatcher = ActionDispatcher::new(sink);
+    fn outcome_builds_enriched_event_from_overlay() {
+        let (dispatcher, _rx) = dispatcher();
         let event = event();
 
-        let outcome = dispatcher.dispatch(
-            &event,
-            &[
-                ActionIntent::DropEvent {
+        let outcome = dispatcher
+            .dispatch(
+                &event,
+                &[ActionIntent::AddMetadata {
                     event_id: event.id.clone(),
-                    reason: Some("filtered".to_owned()),
-                },
-                ActionIntent::StreamToUi {
-                    event_id: event.id.clone(),
-                },
-            ],
+                    key: "severity".to_owned(),
+                    value: "hot".to_owned(),
+                }],
+            )
+            .unwrap();
+
+        let enriched = outcome.enriched_event(&event);
+
+        assert!(event.metadata.is_empty());
+        assert_eq!(
+            enriched.metadata.get("severity").map(String::as_str),
+            Some("hot")
         );
+    }
+
+    #[test]
+    fn drop_event_stops_remaining_actions() {
+        let (dispatcher, _rx) = dispatcher();
+        let event = event();
+
+        let outcome = dispatcher
+            .dispatch(
+                &event,
+                &[
+                    ActionIntent::DropEvent {
+                        event_id: event.id.clone(),
+                        reason: Some("filtered".to_owned()),
+                    },
+                    ActionIntent::StreamToUi {
+                        event_id: event.id.clone(),
+                    },
+                ],
+            )
+            .unwrap();
 
         assert!(outcome.dropped);
         assert_eq!(outcome.executed, vec![ExecutedAction::DropEvent]);
@@ -373,43 +468,139 @@ mod tests {
     }
 
     #[test]
-    fn stream_to_ui_reports_backpressure() {
-        let (sink, _rx) = BoundedRealtimeEventSink::channel(1);
-        let dispatcher = ActionDispatcher::new(sink);
+    fn rejects_too_many_intents_before_side_effects() {
+        let (sink, _rx) = BoundedRealtimeEventSink::try_channel(1).unwrap();
+        let dispatcher = ActionDispatcher::with_limits(
+            sink,
+            DispatchLimits {
+                max_intents_per_event: 1,
+                max_metadata_entries_per_event: 32,
+                max_metadata_key_bytes: 128,
+                max_metadata_value_bytes: 1024,
+            },
+        );
         let event = event();
 
-        let first = dispatcher.dispatch(
-            &event,
-            &[ActionIntent::StreamToUi {
-                event_id: event.id.clone(),
-            }],
-        );
-        let second = dispatcher.dispatch(
-            &event,
-            &[ActionIntent::StreamToUi {
-                event_id: event.id.clone(),
-            }],
-        );
+        let error = dispatcher
+            .dispatch(
+                &event,
+                &[
+                    ActionIntent::StreamToUi {
+                        event_id: event.id.clone(),
+                    },
+                    ActionIntent::DropEvent {
+                        event_id: event.id.clone(),
+                        reason: None,
+                    },
+                ],
+            )
+            .unwrap_err();
 
-        assert!(first.failed.is_empty());
+        assert_eq!(error, DispatchError::TooManyIntents { actual: 2, max: 1 });
+    }
+
+    #[test]
+    fn reports_metadata_entry_limit_per_event() {
+        let (sink, _rx) = BoundedRealtimeEventSink::try_channel(1).unwrap();
+        let dispatcher = ActionDispatcher::with_limits(
+            sink,
+            DispatchLimits {
+                max_intents_per_event: 128,
+                max_metadata_entries_per_event: 1,
+                max_metadata_key_bytes: 128,
+                max_metadata_value_bytes: 1024,
+            },
+        );
+        let event = event();
+
+        let outcome = dispatcher
+            .dispatch(
+                &event,
+                &[
+                    ActionIntent::AddMetadata {
+                        event_id: event.id.clone(),
+                        key: "severity".to_owned(),
+                        value: "hot".to_owned(),
+                    },
+                    ActionIntent::AddMetadata {
+                        event_id: event.id.clone(),
+                        key: "priority".to_owned(),
+                        value: "high".to_owned(),
+                    },
+                ],
+            )
+            .unwrap();
+
+        assert_eq!(outcome.executed.len(), 1);
+        assert_eq!(outcome.failed.len(), 1);
+        assert_eq!(
+            outcome.failed[0].error,
+            DispatchError::TooManyMetadataEntries { actual: 2, max: 1 }
+        );
+    }
+
+    #[test]
+    fn stream_to_ui_reports_backpressure() {
+        let (dispatcher, _rx) = dispatcher();
+        let event = event();
+
+        let first = dispatcher
+            .dispatch(
+                &event,
+                &[ActionIntent::StreamToUi {
+                    event_id: event.id.clone(),
+                }],
+            )
+            .unwrap();
+        let second = dispatcher
+            .dispatch(
+                &event,
+                &[ActionIntent::StreamToUi {
+                    event_id: event.id.clone(),
+                }],
+            )
+            .unwrap();
+
+        assert_eq!(
+            first.executed,
+            vec![ExecutedAction::StreamToUi {
+                receipt: RealtimePublishReceipt { accepted: true }
+            }]
+        );
         assert_eq!(second.failed.len(), 1);
         assert_eq!(second.failed[0].error, DispatchError::RealtimeBackpressure);
     }
 
     #[test]
+    fn invalid_sink_capacity_is_rejected() {
+        let result = BoundedRealtimeEventSink::try_channel(0);
+        assert!(result.is_err());
+
+        if let Err(error) = result {
+            assert_eq!(
+                error,
+                DispatchError::InvalidConfig {
+                    reason: "realtime sink capacity must be greater than zero"
+                }
+            );
+        }
+    }
+
+    #[test]
     fn invalid_metadata_is_reported_per_action() {
-        let (sink, _rx) = BoundedRealtimeEventSink::channel(1);
-        let dispatcher = ActionDispatcher::new(sink);
+        let (dispatcher, _rx) = dispatcher();
         let event = event();
 
-        let outcome = dispatcher.dispatch(
-            &event,
-            &[ActionIntent::AddMetadata {
-                event_id: event.id.clone(),
-                key: "pipe_bolt.internal".to_owned(),
-                value: "blocked".to_owned(),
-            }],
-        );
+        let outcome = dispatcher
+            .dispatch(
+                &event,
+                &[ActionIntent::AddMetadata {
+                    event_id: event.id.clone(),
+                    key: "pipe_bolt.internal".to_owned(),
+                    value: "blocked".to_owned(),
+                }],
+            )
+            .unwrap();
 
         assert!(outcome.executed.is_empty());
         assert_eq!(outcome.failed.len(), 1);
@@ -417,5 +608,43 @@ mod tests {
             outcome.failed[0].error,
             DispatchError::InvalidMetadataKey { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn rule_engine_intents_dispatch_to_ui_with_metadata_overlay() {
+        let rule = RuleDefinition {
+            id: RuleId::new("rule-1").unwrap(),
+            name: "Stream hot telemetry".to_owned(),
+            enabled: true,
+            trigger: RuleTrigger::EventReceived,
+            condition: None,
+            actions: vec![
+                ActionIntentTemplate::AddMetadata {
+                    key: "severity".to_owned(),
+                    value: "hot".to_owned(),
+                },
+                ActionIntentTemplate::StreamToUi,
+            ],
+        };
+        let engine = RuleEngine::new(vec![rule]).unwrap();
+        let event = event();
+        let evaluation = engine.evaluate(&event).unwrap();
+        let (dispatcher, mut rx) = dispatcher();
+
+        let outcome = dispatcher.dispatch(&event, &evaluation.intents).unwrap();
+
+        assert_eq!(evaluation.intents.len(), 2);
+        assert!(outcome.failed.is_empty());
+        assert_eq!(
+            outcome.metadata_overlay.get("severity").map(String::as_str),
+            Some("hot")
+        );
+        assert!(event.metadata.is_empty());
+
+        let streamed = rx.recv().await.unwrap();
+        assert_eq!(
+            streamed.metadata.get("severity").map(String::as_str),
+            Some("hot")
+        );
     }
 }
