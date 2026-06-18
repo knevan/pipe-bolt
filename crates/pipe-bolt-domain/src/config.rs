@@ -32,26 +32,6 @@ pub struct ProjectConfig {
 }
 
 impl ProjectConfig {
-    pub fn new(id: ProjectId, name: impl Into<String>) -> Result<Self, DomainError> {
-        let name = name.into();
-        validate_text("project_name", &name, MAX_NAME_BYTES)?;
-
-        Ok(Self {
-            id,
-            tenant_id: None,
-            name,
-            description: None,
-            enabled: true,
-            version: 1,
-            brokers: Vec::new(),
-            routes: Vec::new(),
-            schema_mappings: Vec::new(),
-            rules: Vec::new(),
-            command_templates: Vec::new(),
-            sinks: Vec::new(),
-        })
-    }
-
     pub fn validate(&self) -> Result<(), DomainError> {
         validate_text("project_name", &self.name, MAX_NAME_BYTES)?;
 
@@ -69,6 +49,10 @@ impl ProjectConfig {
 
         for mapping in &self.schema_mappings {
             mapping.validate()?;
+        }
+
+        for rule in &self.rules {
+            rule.validate()?;
         }
 
         for command_template in &self.command_templates {

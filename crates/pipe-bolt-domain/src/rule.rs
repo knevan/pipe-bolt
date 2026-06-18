@@ -16,7 +16,23 @@ pub struct RuleDefinition {
 
 impl RuleDefinition {
     pub fn validate(&self) -> Result<(), DomainError> {
-        validate_text("rule_name", &self.name, 160)
+        validate_text("rule_name", &self.name, 160)?;
+
+        if self.actions.is_empty() {
+            return Err(DomainError::InvalidFieldPath {
+                reason: "rule must define at least one action",
+            });
+        }
+
+        if let Some(condition) = &self.condition {
+            validate_condition(condition)?;
+        }
+
+        for action in &self.actions {
+            validate_action_template(action)?;
+        }
+
+        Ok(())
     }
 }
 
@@ -60,4 +76,62 @@ pub enum FieldRef {
     DeviceId,
     EventType,
     Topic,
+}
+
+fn validate_condition(condition: &ConditionExpr) -> Result<(), DomainError> {
+    match condition {
+        ConditionExpr::And { conditions } | ConditionExpr::Or { conditions } => {
+            if conditions.is_empty() {
+                return Err(DomainError::InvalidFieldPath {
+                    reason: "condition group must not be empty",
+                });
+            }
+
+            for condition in conditions {
+                validate_condition(condition)?;
+            }
+        }
+        ConditionExpr::Not { condition } => validate_condition(condition)?,
+        ConditionExpr::Exists { field } => validate_field_ref(field)?,
+        ConditionExpr::Equals { left, right }
+        | ConditionExpr::NotEquals { left, right }
+        | ConditionExpr::GreaterThan { left, right }
+        | ConditionExpr::GreaterThanOrEqual { left, right }
+        | ConditionExpr::LessThan { left, right }
+        | ConditionExpr::LessThanOrEqual { left, right }
+        | ConditionExpr::Contains { left, right } => {
+            validate_value_expr(left)?;
+            validate_value_expr(right)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_value_expr(value: &ValueExpr) -> Result<(), DomainError> {
+    match value {
+        ValueExpr::Field { field } => validate_field_ref(field),
+        ValueExpr::Literal { .. } => Ok(()),
+    }
+}
+
+fn validate_field_ref(field: &FieldRef) -> Result<(), DomainError> {
+    if let FieldRef::Extracted { name } = field {
+        validate_text("extracted_field_name", name, 160)?;
+    }
+
+    Ok(())
+}
+
+fn validate_action_template(action: &ActionIntentTemplate) -> Result<(), DomainError> {
+    match action {
+        ActionIntentTemplate::AddMetadata { key, value } => {
+            validate_text("metadata_key", key, 128)?;
+            validate_text("metadata_value", value, 1024)
+        }
+        ActionIntentTemplate::StreamToUi
+        | ActionIntentTemplate::ForwardToSink { .. }
+        | ActionIntentTemplate::PublishCommand { .. }
+        | ActionIntentTemplate::DropEvent => Ok(()),
+    }
 }

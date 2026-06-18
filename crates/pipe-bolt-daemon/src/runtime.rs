@@ -3,10 +3,11 @@ use std::hash::Hash;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use pipe_bolt_core::config::{MqttClientConfig, MqttReconnectConfig, MqttTlsMode};
 use pipe_bolt_core::dispatcher::action::{
-    ActionDispatcher, BoundedRealtimeEventSink, DispatchLimits,
+    ActionDispatcher, DispatchLimits, RealtimeEventSink, RealtimePublishReceipt,
 };
 use pipe_bolt_core::error::{DispatchError, MqttEngineError};
 use pipe_bolt_core::forwarder::{
@@ -23,27 +24,30 @@ use pipe_bolt_core::rule::rules::{RuleEngine, RuleEngineLimits};
 use pipe_bolt_core::web::realtime::router::{default_bind_addr, serve_realtime_bridge_with_state};
 use pipe_bolt_core::web::realtime::state::RealtimeBridgeState;
 use pipe_bolt_domain::{
-    ActionIntentTemplate, BrokerConnectionConfig, BrokerId, MqttQos, PayloadSchemaMapping,
-    ProjectConfig, SinkKind, TlsMode, TopicRouteConfig,
+    ActionIntentTemplate, BackpressurePolicy, BrokerConnectionConfig, BrokerId, MqttQos,
+    NormalizedEvent, PayloadSchemaMapping, ProjectConfig, SinkKind, TlsMode, TopicRouteConfig,
 };
 use rumqttc::QoS;
 use thiserror::Error;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{broadcast, mpsc, watch};
 use tokio::task::{JoinError, JoinHandle};
+use tokio::time::timeout;
 
-const DEFAULT_REALTIME_EVENT_QUEUE_CAPACITY: usize = 1024;
+const DEFAULT_REALTIME_EVENT_CAPACITY: usize = 1024;
+const DEFAULT_WORKER_JOIN_TIMEOUT: Duration = Duration::from_secs(10);
 
-type RuntimeDispatcher = ActionDispatcher<BoundedRealtimeEventSink, BoundedHttpForwarder>;
+type RuntimeDispatcher = ActionDispatcher<RuntimeRealtimeSink, BoundedHttpForwarder>;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub struct RuntimeSettings {
     pub forward_limits: ForwardLimits,
     pub egress_policy: EgressPolicy,
     pub normalizer_limits: NormalizerLimits,
     pub rule_limits: RuleEngineLimits,
     pub dispatch_limits: DispatchLimits,
-    pub realtime_event_queue_capacity: usize,
+    pub realtime_event_capacity: usize,
     pub realtime_bridge_bind_addr: SocketAddr,
+    pub worker_join_timeout: Duration,
 }
 
 impl Default for RuntimeSettings {
@@ -54,8 +58,9 @@ impl Default for RuntimeSettings {
             normalizer_limits: NormalizerLimits::default(),
             rule_limits: RuleEngineLimits::default(),
             dispatch_limits: DispatchLimits::default(),
-            realtime_event_queue_capacity: DEFAULT_REALTIME_EVENT_QUEUE_CAPACITY,
+            realtime_event_capacity: DEFAULT_REALTIME_EVENT_CAPACITY,
             realtime_bridge_bind_addr: default_bind_addr(),
+            worker_join_timeout: DEFAULT_WORKER_JOIN_TIMEOUT,
         }
     }
 }
@@ -67,6 +72,11 @@ pub enum RuntimeError {
 
     #[error("invalid runtime config: {0}")]
     InvalidConfig(&'static str),
+
+    #[error(
+        "multiple enabled brokers are not supported by this runtime slice: {count} enabled brokers"
+    )]
+    MultipleEnabledBrokersUnsupported { count: usize },
 
     #[error("duplicate {collection} id '{id}'")]
     DuplicateId {
@@ -89,6 +99,15 @@ pub enum RuntimeError {
         schema_mapping_id: String,
     },
 
+    #[error("route '{route_id}' uses unsupported backpressure policy '{policy}'")]
+    UnsupportedBackpressurePolicy {
+        route_id: String,
+        policy: &'static str,
+    },
+
+    #[error("enabled command templates are not supported by this runtime slice: '{template_id}'")]
+    EnabledCommandTemplateUnsupported { template_id: String },
+
     #[error("enabled rule '{rule_id}' references unknown sink '{sink_id}'")]
     RuleReferencesUnknownSink { rule_id: String, sink_id: String },
 
@@ -107,6 +126,9 @@ pub enum RuntimeError {
     #[error("dispatch runtime error: {0}")]
     Dispatch(#[from] DispatchError),
 
+    #[error("worker '{name}' join timed out")]
+    WorkerJoinTimeout { name: &'static str },
+
     #[error("worker '{name}' join failed")]
     WorkerJoin {
         name: &'static str,
@@ -118,22 +140,22 @@ pub enum RuntimeError {
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Default)]
 pub struct RuntimeStatsSnapshot {
     pub normalized_total: u64,
-    pub route_miss_total: u64,
     pub matched_rule_total: u64,
     pub action_intent_total: u64,
     pub dispatch_failed_total: u64,
-    pub realtime_event_total: u64,
+    pub realtime_event_published_total: u64,
+    pub realtime_event_no_receiver_total: u64,
     pub forward_outcome_total: u64,
 }
 
 #[derive(Debug, Default)]
 pub struct RuntimeStats {
     normalized_total: AtomicU64,
-    route_miss_total: AtomicU64,
     matched_rule_total: AtomicU64,
     action_intent_total: AtomicU64,
     dispatch_failed_total: AtomicU64,
-    realtime_event_total: AtomicU64,
+    realtime_event_published_total: AtomicU64,
+    realtime_event_no_receiver_total: AtomicU64,
     forward_outcome_total: AtomicU64,
 }
 
@@ -141,21 +163,21 @@ impl RuntimeStats {
     pub fn snapshot(&self) -> RuntimeStatsSnapshot {
         RuntimeStatsSnapshot {
             normalized_total: self.normalized_total.load(Ordering::Relaxed),
-            route_miss_total: self.route_miss_total.load(Ordering::Relaxed),
             matched_rule_total: self.matched_rule_total.load(Ordering::Relaxed),
             action_intent_total: self.action_intent_total.load(Ordering::Relaxed),
             dispatch_failed_total: self.dispatch_failed_total.load(Ordering::Relaxed),
-            realtime_event_total: self.realtime_event_total.load(Ordering::Relaxed),
+            realtime_event_published_total: self
+                .realtime_event_published_total
+                .load(Ordering::Relaxed),
+            realtime_event_no_receiver_total: self
+                .realtime_event_no_receiver_total
+                .load(Ordering::Relaxed),
             forward_outcome_total: self.forward_outcome_total.load(Ordering::Relaxed),
         }
     }
 
     fn record_normalized(&self) {
         self.normalized_total.fetch_add(1, Ordering::Relaxed);
-    }
-
-    fn record_route_miss(&self) {
-        self.route_miss_total.fetch_add(1, Ordering::Relaxed);
     }
 
     fn record_rule_evaluation(&self, matched_rules: usize, action_intents: usize) {
@@ -170,12 +192,41 @@ impl RuntimeStats {
             .fetch_add(saturating_usize_to_u64(failures), Ordering::Relaxed);
     }
 
-    fn record_realtime_event(&self) {
-        self.realtime_event_total.fetch_add(1, Ordering::Relaxed);
+    fn record_realtime_event_published(&self) {
+        self.realtime_event_published_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_realtime_event_no_receiver(&self) {
+        self.realtime_event_no_receiver_total
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     fn record_forward_outcome(&self) {
         self.forward_outcome_total.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[derive(Clone)]
+pub struct RuntimeRealtimeSink {
+    tx: broadcast::Sender<NormalizedEvent>,
+    stats: Arc<RuntimeStats>,
+}
+
+impl RuntimeRealtimeSink {
+    fn new(tx: broadcast::Sender<NormalizedEvent>, stats: Arc<RuntimeStats>) -> Self {
+        Self { tx, stats }
+    }
+}
+
+impl RealtimeEventSink for RuntimeRealtimeSink {
+    fn try_publish(&self, event: NormalizedEvent) -> Result<RealtimePublishReceipt, DispatchError> {
+        match self.tx.send(event) {
+            Ok(_) => self.stats.record_realtime_event_published(),
+            Err(_) => self.stats.record_realtime_event_no_receiver(),
+        }
+
+        Ok(RealtimePublishReceipt { accepted: true })
     }
 }
 
@@ -185,14 +236,22 @@ pub struct ProjectRuntime {
     workers: Vec<RuntimeWorker>,
     stats: Arc<RuntimeStats>,
     forwarder_stats: Arc<ForwarderStats>,
+    realtime_tx: broadcast::Sender<NormalizedEvent>,
+    worker_join_timeout: Duration,
 }
 
 impl ProjectRuntime {
-    pub fn start(config: ProjectConfig, settings: RuntimeSettings) -> Result<Self, RuntimeError> {
+    pub async fn start(
+        config: ProjectConfig,
+        settings: RuntimeSettings,
+    ) -> Result<Self, RuntimeError> {
+        validate_runtime_settings(&settings)?;
         validate_runtime_config(&config)?;
 
         let stats = Arc::new(RuntimeStats::default());
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (realtime_tx, _) = broadcast::channel(settings.realtime_event_capacity);
+        let realtime_sink = RuntimeRealtimeSink::new(realtime_tx.clone(), Arc::clone(&stats));
 
         let (forwarder, forward_worker, forward_outcomes) =
             BoundedHttpForwarder::try_channel_with_policy(
@@ -202,13 +261,10 @@ impl ProjectRuntime {
             )?;
         let forwarder_stats = forwarder.stats();
 
-        let (realtime_sink, realtime_events) =
-            BoundedRealtimeEventSink::try_channel(settings.realtime_event_queue_capacity)?;
         let rule_engine = RuleEngine::with_limits(config.rules.clone(), settings.rule_limits)?;
         let dispatcher =
             ActionDispatcher::with_limits(realtime_sink, forwarder, settings.dispatch_limits);
         let schema_mappings = Arc::new(config.schema_mappings.clone());
-
         let pending_brokers = build_pending_broker_runtimes(
             &config,
             &settings,
@@ -217,6 +273,17 @@ impl ProjectRuntime {
             dispatcher,
             Arc::clone(&stats),
         )?;
+
+        let mut mqtt_engines = Vec::with_capacity(pending_brokers.len());
+        for pending in pending_brokers {
+            match MqttEngine::spawn(pending.config, pending.router) {
+                Ok(engine) => mqtt_engines.push(engine),
+                Err(error) => {
+                    shutdown_mqtt_engines(mqtt_engines).await;
+                    return Err(RuntimeError::from(error));
+                }
+            }
+        }
 
         let mut workers = Vec::new();
         workers.push(RuntimeWorker::spawn("forwarder", async move {
@@ -231,27 +298,23 @@ impl ProjectRuntime {
                 Arc::clone(&stats),
             ),
         ));
-        workers.push(RuntimeWorker::spawn(
-            "realtime-event-consumer",
-            consume_realtime_events(realtime_events, shutdown_tx.subscribe(), Arc::clone(&stats)),
-        ));
-
-        let mut mqtt_engines = Vec::with_capacity(pending_brokers.len());
-
-        for pending in pending_brokers {
-            mqtt_engines.push(MqttEngine::spawn(pending.config, pending.router)?);
-        }
 
         if let Some(engine) = mqtt_engines.first() {
             let realtime_state = RealtimeBridgeState::new(engine.handle());
             let bind_addr = settings.realtime_bridge_bind_addr;
             let shutdown_rx = shutdown_tx.subscribe();
-            workers.push(RuntimeWorker::spawn("realtime-bridge", async move {
+            workers.push(RuntimeWorker::spawn("legacy-realtime-bridge", async move {
                 serve_realtime_bridge_with_state(bind_addr, realtime_state, shutdown_rx)
                     .await
                     .map_err(RuntimeError::from)
             }));
         }
+
+        tracing::info!(
+            project_id = %config.id,
+            broker_count = mqtt_engines.len(),
+            "project runtime started"
+        );
 
         Ok(Self {
             mqtt_engines,
@@ -259,6 +322,8 @@ impl ProjectRuntime {
             workers,
             stats,
             forwarder_stats,
+            realtime_tx,
+            worker_join_timeout: settings.worker_join_timeout,
         })
     }
 
@@ -270,20 +335,38 @@ impl ProjectRuntime {
         self.forwarder_stats.snapshot()
     }
 
+    pub fn subscribe_realtime_events(&self) -> broadcast::Receiver<NormalizedEvent> {
+        self.realtime_tx.subscribe()
+    }
+
     pub async fn shutdown(self) -> Result<(), RuntimeError> {
         let Self {
             mqtt_engines,
             shutdown_tx,
             workers,
+            worker_join_timeout,
             ..
         } = self;
+        let mut first_error = None;
 
         for engine in mqtt_engines {
-            engine.shutdown().await?;
+            if let Err(error) = engine.shutdown().await {
+                remember_first_error(&mut first_error, RuntimeError::from(error));
+            }
         }
 
         let _ = shutdown_tx.send(true);
-        join_workers(workers).await
+
+        if let Err(error) = join_workers(workers, worker_join_timeout).await {
+            remember_first_error(&mut first_error, error);
+        }
+
+        if let Some(error) = first_error {
+            return Err(error);
+        }
+
+        tracing::info!("project runtime stopped");
+        Ok(())
     }
 }
 
@@ -322,10 +405,6 @@ fn build_pending_broker_runtimes(
         .iter()
         .filter(|broker| broker.enabled)
         .collect::<Vec<_>>();
-
-    if enabled_brokers.is_empty() {
-        return Err(RuntimeError::NoEnabledBroker);
-    }
 
     let mut pending = Vec::with_capacity(enabled_brokers.len());
 
@@ -431,7 +510,10 @@ fn handle_pipeline_message(
 ) -> Result<(), MqttEngineError> {
     let Some(event) = normalize_routed_message(matcher, normalizer, schema_mappings, message)?
     else {
-        stats.record_route_miss();
+        tracing::debug!(
+            topic = message.topic(),
+            "matched handler could not normalize route"
+        );
         return Ok(());
     };
 
@@ -442,6 +524,14 @@ fn handle_pipeline_message(
 
     let dispatch = dispatcher.dispatch(&event, &evaluation.intents)?;
     stats.record_dispatch_failures(dispatch.failed.len());
+
+    if !dispatch.failed.is_empty() {
+        tracing::warn!(
+            event_id = %event.id,
+            failed_actions = dispatch.failed.len(),
+            "one or more action intents failed at dispatch boundary"
+        );
+    }
 
     Ok(())
 }
@@ -557,67 +647,76 @@ async fn consume_forward_outcomes(
 
 fn record_forward_outcome(stats: &RuntimeStats, outcome: ForwardDeliveryOutcome) {
     stats.record_forward_outcome();
-    eprintln!(
-        "forward delivery outcome: event_id={} sink_id={} status={:?}",
-        outcome.event_id, outcome.sink_id, outcome.status
+    tracing::info!(
+        event_id = %outcome.event_id,
+        sink_id = %outcome.sink_id,
+        status = ?outcome.status,
+        "forward delivery outcome"
     );
 }
 
-async fn consume_realtime_events(
-    mut events: mpsc::Receiver<pipe_bolt_domain::NormalizedEvent>,
-    mut shutdown_rx: watch::Receiver<bool>,
-    stats: Arc<RuntimeStats>,
-) -> Result<(), RuntimeError> {
-    loop {
-        tokio::select! {
-            biased;
-
-            changed = shutdown_rx.changed() => {
-                if changed.is_err() || *shutdown_rx.borrow() {
-                    events.close();
-                    break;
-                }
-            }
-
-            event = events.recv() => {
-                let Some(_event) = event else {
-                    break;
-                };
-
-                stats.record_realtime_event();
-            }
+async fn shutdown_mqtt_engines(mqtt_engines: Vec<MqttEngine>) {
+    for engine in mqtt_engines {
+        if let Err(error) = engine.shutdown().await {
+            tracing::warn!(error = %error, "failed to shutdown MQTT engine during startup rollback");
         }
     }
-
-    while let Some(_event) = events.recv().await {
-        stats.record_realtime_event();
-    }
-
-    Ok(())
 }
 
-async fn join_workers(workers: Vec<RuntimeWorker>) -> Result<(), RuntimeError> {
+async fn join_workers(
+    workers: Vec<RuntimeWorker>,
+    join_timeout: Duration,
+) -> Result<(), RuntimeError> {
     let mut first_error = None;
 
     for worker in workers {
-        match worker.handle.await {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) if first_error.is_none() => {
-                first_error = Some(error);
-            }
-            Ok(Err(_)) => {}
-            Err(source) if first_error.is_none() => {
-                first_error = Some(RuntimeError::WorkerJoin {
+        let mut handle = worker.handle;
+
+        match timeout(join_timeout, &mut handle).await {
+            Ok(Ok(Ok(()))) => {}
+            Ok(Ok(Err(error))) => remember_first_error(&mut first_error, error),
+            Ok(Err(source)) => remember_first_error(
+                &mut first_error,
+                RuntimeError::WorkerJoin {
                     name: worker.name,
                     source,
-                });
+                },
+            ),
+            Err(_) => {
+                handle.abort();
+                let _ = handle.await;
+                remember_first_error(
+                    &mut first_error,
+                    RuntimeError::WorkerJoinTimeout { name: worker.name },
+                );
             }
-            Err(_) => {}
         }
     }
 
     if let Some(error) = first_error {
         return Err(error);
+    }
+
+    Ok(())
+}
+
+fn remember_first_error(first_error: &mut Option<RuntimeError>, error: RuntimeError) {
+    if first_error.is_none() {
+        *first_error = Some(error);
+    }
+}
+
+fn validate_runtime_settings(settings: &RuntimeSettings) -> Result<(), RuntimeError> {
+    if settings.realtime_event_capacity == 0 {
+        return Err(RuntimeError::InvalidConfig(
+            "realtime event capacity must be greater than zero",
+        ));
+    }
+
+    if settings.worker_join_timeout.is_zero() {
+        return Err(RuntimeError::InvalidConfig(
+            "worker join timeout must be greater than zero",
+        ));
     }
 
     Ok(())
@@ -630,14 +729,10 @@ fn validate_runtime_config(config: &ProjectConfig) -> Result<(), RuntimeError> {
         return Err(RuntimeError::ProjectDisabled);
     }
 
-    if config.routes.is_empty() {
-        return Err(RuntimeError::InvalidConfig(
-            "project config must include at least one route",
-        ));
-    }
-
     validate_unique_ids(config)?;
-    validate_route_references(config)?;
+    validate_single_enabled_broker(config)?;
+    validate_routes(config)?;
+    validate_command_templates(config)?;
     validate_rule_sink_references(config)?;
 
     Ok(())
@@ -661,6 +756,7 @@ fn validate_unique_ids(config: &ProjectConfig) -> Result<(), RuntimeError> {
 
     let mut rule_ids = HashSet::with_capacity(config.rules.len());
     for rule in &config.rules {
+        rule.validate()?;
         insert_unique_id(&mut rule_ids, &rule.id, "rule")?;
     }
 
@@ -695,7 +791,21 @@ where
     Ok(())
 }
 
-fn validate_route_references(config: &ProjectConfig) -> Result<(), RuntimeError> {
+fn validate_single_enabled_broker(config: &ProjectConfig) -> Result<(), RuntimeError> {
+    let enabled_count = config
+        .brokers
+        .iter()
+        .filter(|broker| broker.enabled)
+        .count();
+
+    match enabled_count {
+        0 => Err(RuntimeError::NoEnabledBroker),
+        1 => Ok(()),
+        count => Err(RuntimeError::MultipleEnabledBrokersUnsupported { count }),
+    }
+}
+
+fn validate_routes(config: &ProjectConfig) -> Result<(), RuntimeError> {
     let enabled_broker_ids = config
         .brokers
         .iter()
@@ -708,7 +818,11 @@ fn validate_route_references(config: &ProjectConfig) -> Result<(), RuntimeError>
         .map(|mapping| mapping.id.clone())
         .collect::<HashSet<_>>();
 
+    let mut enabled_route_count = 0usize;
+
     for route in config.routes.iter().filter(|route| route.enabled) {
+        enabled_route_count += 1;
+
         if !enabled_broker_ids.contains(&route.broker_id) {
             return Err(RuntimeError::RouteReferencesUnavailableBroker {
                 route_id: route.id.to_string(),
@@ -724,8 +838,40 @@ fn validate_route_references(config: &ProjectConfig) -> Result<(), RuntimeError>
                 schema_mapping_id: schema_mapping_id.to_string(),
             });
         }
+
+        if route.backpressure != BackpressurePolicy::Reject {
+            return Err(RuntimeError::UnsupportedBackpressurePolicy {
+                route_id: route.id.to_string(),
+                policy: backpressure_policy_name(route.backpressure),
+            });
+        }
     }
 
+    if enabled_route_count == 0 {
+        let broker_id = config
+            .brokers
+            .iter()
+            .find(|broker| broker.enabled)
+            .map(|broker| broker.id.to_string())
+            .unwrap_or_else(|| "<none>".to_owned());
+
+        return Err(RuntimeError::NoEnabledRoutesForBroker { broker_id });
+    }
+
+    Ok(())
+}
+
+/// Validates that there are no enabled command templates, as they are not supported in this slice.
+fn validate_command_templates(config: &ProjectConfig) -> Result<(), RuntimeError> {
+    if let Some(template) = config
+        .command_templates
+        .iter()
+        .find(|template| template.enabled)
+    {
+        return Err(RuntimeError::EnabledCommandTemplateUnsupported {
+            template_id: template.id.to_string(),
+        });
+    }
     Ok(())
 }
 
@@ -762,6 +908,244 @@ fn validate_rule_sink_references(config: &ProjectConfig) -> Result<(), RuntimeEr
     Ok(())
 }
 
+fn backpressure_policy_name(policy: BackpressurePolicy) -> &'static str {
+    match policy {
+        BackpressurePolicy::DropNewest => "drop_newest",
+        BackpressurePolicy::DropOldest => "drop_oldest",
+        BackpressurePolicy::Reject => "reject",
+        BackpressurePolicy::BlockProducer => "block_producer",
+    }
+}
+
 fn saturating_usize_to_u64(value: usize) -> u64 {
     u64::try_from(value).unwrap_or(u64::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use pipe_bolt_domain::{
+        ActionIntentTemplate, BackpressurePolicy, BrokerConnectionConfig, BrokerId,
+        CommandTemplate, CommandTemplateId, DeviceIdExtraction, HttpMethod, MqttQos,
+        PayloadCodecKind, ProjectConfig, ProjectId, ReconnectPolicy, RuleDefinition, RuleId,
+        RuleTrigger, SinkDefinition, SinkId, SinkKind, TlsMode, TopicFilter, TopicRouteConfig,
+    };
+
+    use super::*;
+
+    #[test]
+    fn runtime_rejects_disabled_project() {
+        let mut config = project_config();
+        config.enabled = false;
+
+        let error = validate_runtime_config(&config).expect_err("disabled project error");
+
+        assert!(matches!(error, RuntimeError::ProjectDisabled));
+    }
+
+    #[test]
+    fn runtime_rejects_duplicate_ids() {
+        let mut config = project_config();
+        config
+            .routes
+            .push(route("route-telemetry", "devices/+/status"));
+
+        let error = validate_runtime_config(&config).expect_err("duplicate route error");
+
+        assert!(matches!(
+            error,
+            RuntimeError::DuplicateId {
+                collection: "route",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn runtime_rejects_multiple_enabled_brokers() {
+        let mut config = project_config();
+        config.brokers.push(broker("broker-secondary", true));
+
+        let error = validate_runtime_config(&config).expect_err("multiple broker error");
+
+        assert!(matches!(
+            error,
+            RuntimeError::MultipleEnabledBrokersUnsupported { count: 2 }
+        ));
+    }
+
+    #[test]
+    fn runtime_rejects_route_to_unknown_or_disabled_broker() {
+        let mut config = project_config();
+        config.routes[0].broker_id = BrokerId::new("missing-broker").expect("broker id");
+
+        let error = validate_runtime_config(&config).expect_err("missing broker error");
+
+        assert!(matches!(
+            error,
+            RuntimeError::RouteReferencesUnavailableBroker { .. }
+        ));
+    }
+
+    #[test]
+    fn runtime_rejects_unsupported_backpressure_policy() {
+        let mut config = project_config();
+        config.routes[0].backpressure = BackpressurePolicy::DropOldest;
+
+        let error = validate_runtime_config(&config).expect_err("backpressure error");
+
+        assert!(matches!(
+            error,
+            RuntimeError::UnsupportedBackpressurePolicy { .. }
+        ));
+    }
+
+    #[test]
+    fn runtime_rejects_rule_to_unknown_sink() {
+        let mut config = project_config();
+        config.rules[0].actions = vec![ActionIntentTemplate::ForwardToSink {
+            sink_id: SinkId::new("missing-sink").expect("sink id"),
+        }];
+
+        let error = validate_runtime_config(&config).expect_err("missing sink error");
+
+        assert!(matches!(
+            error,
+            RuntimeError::RuleReferencesUnknownSink { .. }
+        ));
+    }
+
+    #[test]
+    fn runtime_rejects_enabled_command_templates() {
+        let mut config = project_config();
+        config.command_templates.push(CommandTemplate {
+            id: CommandTemplateId::new("command-1").expect("command template id"),
+            name: "Turn Relay On".to_owned(),
+            broker_id: BrokerId::new("broker-local").expect("broker id"),
+            topic_template: "devices/{device_id}/commands/relay".to_owned(),
+            payload_template: serde_json::json!({ "relay": 1, "state": "on" }),
+            qos: MqttQos::AtLeastOnce,
+            retain: false,
+            enabled: true,
+        });
+
+        let error = validate_runtime_config(&config).expect_err("command template error");
+
+        assert!(matches!(
+            error,
+            RuntimeError::EnabledCommandTemplateUnsupported { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn shutdown_join_workers_reports_timeout() {
+        let worker = RuntimeWorker::spawn("stuck-worker", async {
+            std::future::pending::<Result<(), RuntimeError>>().await
+        });
+
+        let error = join_workers(vec![worker], Duration::from_millis(1))
+            .await
+            .expect_err("worker join timeout");
+
+        assert!(matches!(
+            error,
+            RuntimeError::WorkerJoinTimeout {
+                name: "stuck-worker"
+            }
+        ));
+    }
+
+    #[test]
+    fn runtime_builds_subscription_set_from_enabled_routes() {
+        let routes = vec![
+            route_with_qos("route-1", "devices/+/telemetry", MqttQos::AtMostOnce),
+            route_with_qos("route-2", "devices/+/telemetry", MqttQos::ExactlyOnce),
+        ];
+
+        let subscriptions = merged_subscriptions(&routes);
+
+        assert_eq!(subscriptions.len(), 1);
+        assert_eq!(subscriptions[0].0, "devices/+/telemetry");
+        assert_eq!(subscriptions[0].1, QoS::ExactlyOnce);
+    }
+
+    fn project_config() -> ProjectConfig {
+        ProjectConfig {
+            id: ProjectId::new("project-local").expect("project id"),
+            tenant_id: None,
+            name: "Local Project".to_owned(),
+            description: None,
+            enabled: true,
+            version: 1,
+            brokers: vec![broker("broker-local", true)],
+            routes: vec![route("route-telemetry", "devices/+/telemetry")],
+            schema_mappings: Vec::new(),
+            rules: vec![stream_rule()],
+            command_templates: Vec::new(),
+            sinks: Vec::new(),
+        }
+    }
+
+    fn broker(id: &str, enabled: bool) -> BrokerConnectionConfig {
+        BrokerConnectionConfig {
+            id: BrokerId::new(id).expect("broker id"),
+            name: id.to_owned(),
+            host: "localhost".to_owned(),
+            port: 1883,
+            tls: TlsMode::Disabled,
+            credentials: None,
+            keep_alive: Duration::from_secs(30),
+            clean_session: false,
+            client_id: format!("pipe-bolt-{id}"),
+            reconnect: ReconnectPolicy::default(),
+            enabled,
+        }
+    }
+
+    fn route(id: &str, topic_filter: &str) -> TopicRouteConfig {
+        route_with_qos(id, topic_filter, MqttQos::AtLeastOnce)
+    }
+
+    fn route_with_qos(id: &str, topic_filter: &str, qos: MqttQos) -> TopicRouteConfig {
+        TopicRouteConfig {
+            id: pipe_bolt_domain::RouteId::new(id).expect("route id"),
+            broker_id: BrokerId::new("broker-local").expect("broker id"),
+            name: id.to_owned(),
+            topic_filter: TopicFilter::new(topic_filter).expect("topic filter"),
+            codec: PayloadCodecKind::Json,
+            schema_mapping_id: None,
+            device_id: DeviceIdExtraction::TopicWildcardIndex { index: 0 },
+            event_type: "telemetry".to_owned(),
+            qos,
+            enabled: true,
+            backpressure: BackpressurePolicy::Reject,
+        }
+    }
+
+    fn stream_rule() -> RuleDefinition {
+        RuleDefinition {
+            id: RuleId::new("rule-stream-all").expect("rule id"),
+            name: "Stream All Events".to_owned(),
+            enabled: true,
+            trigger: RuleTrigger::EventReceived,
+            condition: None,
+            actions: vec![ActionIntentTemplate::StreamToUi],
+        }
+    }
+
+    #[allow(dead_code)]
+    fn webhook_sink(id: &str) -> SinkDefinition {
+        SinkDefinition {
+            id: SinkId::new(id).expect("sink id"),
+            name: id.to_owned(),
+            enabled: true,
+            kind: SinkKind::Webhook {
+                url: "https://example.com/events".to_owned(),
+                method: HttpMethod::Post,
+                headers: Vec::new(),
+                timeout: Duration::from_secs(5),
+            },
+        }
+    }
 }

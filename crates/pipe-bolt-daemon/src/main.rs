@@ -17,17 +17,29 @@ pub mod runtime;
 
 use std::error::Error;
 
-use crate::config_loader::{ProjectConfigLoadOptions, load_project_config};
-use crate::runtime::{ProjectRuntime, RuntimeSettings};
+use crate::config_loader::{DaemonRuntimeConfig, load_project_config};
+use crate::runtime::ProjectRuntime;
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
-    let load_options = ProjectConfigLoadOptions::from_env_and_args()?;
-    let project_config = load_project_config(&load_options).await?;
-    let runtime = ProjectRuntime::start(project_config, RuntimeSettings::default())?;
+async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
+    let daemon_config = DaemonRuntimeConfig::from_env_and_args()?;
+    init_tracing(&daemon_config.log_filter)?;
+
+    let project_config = load_project_config(&daemon_config.project_config).await?;
+    let runtime = ProjectRuntime::start(project_config, daemon_config.runtime).await?;
 
     pipe_bolt_core::web::realtime::router::graceful_signal().await;
+
     runtime.shutdown().await?;
 
+    Ok(())
+}
+
+/// Initializes the tracing subscriber with EnvFilter support
+fn init_tracing(filter: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let env_filter = tracing_subscriber::EnvFilter::try_new(filter)?;
+    tracing_subscriber::fmt()
+        .with_env_filter(env_filter)
+        .try_init()?;
     Ok(())
 }

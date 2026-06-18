@@ -9,7 +9,7 @@
     clippy::trivially_copy_pass_by_ref,
     clippy::clone_on_ref_ptr,
     // clippy::unwrap_used,
-    // clippy::missing_const_for_fn,
+    clippy::missing_const_for_fn,
 )]
 
 pub mod action;

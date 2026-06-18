@@ -126,8 +126,6 @@ struct CompiledRule {
 }
 
 fn validate_rule(rule: &RuleDefinition, limits: RuleEngineLimits) -> Result<(), MqttEngineError> {
-    rule.validate()?;
-
     if matches!(rule.trigger, RuleTrigger::CommandRequested { .. }) {
         return Err(RuleError::UnsupportedTrigger {
             rule_id: rule.id.to_string(),
@@ -180,6 +178,8 @@ fn validate_rule(rule: &RuleDefinition, limits: RuleEngineLimits) -> Result<(), 
             .into());
         }
     }
+
+    rule.validate()?;
 
     Ok(())
 }
