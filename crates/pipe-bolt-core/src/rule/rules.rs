@@ -190,15 +190,12 @@ fn validate_action(
     limits: RuleEngineLimits,
 ) -> Result<(), MqttEngineError> {
     match action {
-        ActionIntentTemplate::StreamToUi | ActionIntentTemplate::DropEvent => Ok(()),
+        ActionIntentTemplate::StreamToUi
+        | ActionIntentTemplate::DropEvent
+        | ActionIntentTemplate::ForwardToSink { .. } => Ok(()),
         ActionIntentTemplate::AddMetadata { key, value } => {
             validate_metadata_action(rule, key, value, limits)
         }
-        ActionIntentTemplate::ForwardToSink { .. } => Err(RuleError::UnsupportedAction {
-            rule_id: rule.id.to_string(),
-            action: "forward_to_sink",
-        }
-        .into()),
         ActionIntentTemplate::PublishCommand { .. } => Err(RuleError::UnsupportedAction {
             rule_id: rule.id.to_string(),
             action: "publish_command",
@@ -475,11 +472,11 @@ fn action_to_intent(
             key: key.clone(),
             value: value.clone(),
         }),
-        ActionIntentTemplate::ForwardToSink { .. } => Err(RuleError::UnsupportedAction {
-            rule_id: rule.id.to_string(),
-            action: "forward_to_sink",
-        }
-        .into()),
+        ActionIntentTemplate::ForwardToSink { sink_id } => Ok(ActionIntent::ForwardToSink {
+            event_id: event.id.clone(),
+            sink_id: sink_id.clone(),
+            projection: None,
+        }),
         ActionIntentTemplate::PublishCommand { .. } => Err(RuleError::UnsupportedAction {
             rule_id: rule.id.to_string(),
             action: "publish_command",
@@ -831,18 +828,22 @@ mod tests {
     }
 
     #[test]
-    fn rejects_forward_to_sink_before_dispatcher_exists() {
-        let error = RuleEngine::new(vec![rule(
+    fn emits_forward_to_sink_intent() {
+        let sink_id = pipe_bolt_domain::SinkId::new("sink-1").unwrap();
+        let engine = RuleEngine::new(vec![rule(
             None,
             vec![ActionIntentTemplate::ForwardToSink {
-                sink_id: pipe_bolt_domain::SinkId::new("sink-1").unwrap(),
+                sink_id: sink_id.clone(),
             }],
         )])
-        .unwrap_err();
+        .unwrap();
 
+        let evaluation = engine.evaluate(&event()).unwrap();
+
+        assert_eq!(evaluation.intents.len(), 1);
         assert!(matches!(
-            error,
-            MqttEngineError::Rule(RuleError::UnsupportedAction { .. })
+            &evaluation.intents[0],
+            ActionIntent::ForwardToSink { sink_id: actual, .. } if actual == &sink_id
         ));
     }
 

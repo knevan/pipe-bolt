@@ -19,6 +19,7 @@ pub mod command;
 pub mod config;
 pub mod dispatcher;
 pub mod error;
+pub mod forwarder;
 pub mod message;
 pub mod mqtt;
 pub mod pipeline;

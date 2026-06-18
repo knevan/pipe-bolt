@@ -7,6 +7,7 @@ use crate::action_metadata::{
     ActionMetadataLimits, MetadataValidationError, validate_action_metadata,
 };
 use crate::error::DispatchError;
+use crate::forwarder::{EventForwarder, ForwardReceipt, ForwardRequest};
 
 const DEFAULT_MAX_INTENTS_PER_EVENT: usize = 128;
 const DEFAULT_MAX_METADATA_ENTRIES_PER_EVENT: usize = 32;
@@ -78,6 +79,7 @@ impl DispatchOutcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExecutedAction {
     StreamToUi { receipt: RealtimePublishReceipt },
+    ForwardToSink { receipt: ForwardReceipt },
     AddMetadata { key: String },
     DropEvent,
 }
@@ -150,21 +152,27 @@ impl RealtimeEventSink for BoundedRealtimeEventSink {
 
 /// Deterministic dispatcher for rule action intents.
 #[derive(Clone)]
-pub struct ActionDispatcher<S> {
-    realtime: S,
+pub struct ActionDispatcher<R, F> {
+    realtime: R,
+    forwarder: F,
     limits: DispatchLimits,
 }
 
-impl<S> ActionDispatcher<S>
+impl<R, F> ActionDispatcher<R, F>
 where
-    S: RealtimeEventSink,
+    R: RealtimeEventSink,
+    F: EventForwarder,
 {
-    pub fn new(realtime: S) -> Self {
-        Self::with_limits(realtime, DispatchLimits::default())
+    pub fn new(realtime: R, forwarder: F) -> Self {
+        Self::with_limits(realtime, forwarder, DispatchLimits::default())
     }
 
-    pub fn with_limits(realtime: S, limits: DispatchLimits) -> Self {
-        Self { realtime, limits }
+    pub fn with_limits(realtime: R, forwarder: F, limits: DispatchLimits) -> Self {
+        Self {
+            realtime,
+            forwarder,
+            limits,
+        }
     }
 
     pub fn dispatch(
@@ -212,6 +220,27 @@ where
                         Err(error) => outcome.failed.push(FailedAction { action_type, error }),
                     }
                 }
+                ActionIntent::ForwardToSink {
+                    sink_id,
+                    projection,
+                    ..
+                } => {
+                    let enriched = context.enriched_event();
+                    let projection = projection
+                        .as_ref()
+                        .map(|projection| projection.clone().into_iter().collect());
+
+                    match self.forwarder.try_forward(ForwardRequest {
+                        event: enriched,
+                        sink_id: sink_id.clone(),
+                        projection,
+                    }) {
+                        Ok(receipt) => outcome
+                            .executed
+                            .push(ExecutedAction::ForwardToSink { receipt }),
+                        Err(error) => outcome.failed.push(FailedAction { action_type, error }),
+                    }
+                }
                 ActionIntent::DropEvent { .. } => {
                     outcome.dropped = true;
                     outcome.executed.push(ExecutedAction::DropEvent);
@@ -223,11 +252,6 @@ where
                             .push(ExecutedAction::AddMetadata { key: key.clone() }),
                         Err(error) => outcome.failed.push(FailedAction { action_type, error }),
                     }
-                }
-                ActionIntent::ForwardToSink { .. } => {
-                    outcome.skipped.push(SkippedAction::Unsupported {
-                        action_type: "forward_to_sink",
-                    });
                 }
                 ActionIntent::PublishMqttCommand { .. } => {
                     outcome.skipped.push(SkippedAction::Unsupported {
@@ -339,6 +363,7 @@ mod tests {
     use time::OffsetDateTime;
 
     use super::*;
+    use crate::forwarder::DisabledForwarder;
     use crate::rule::rules::RuleEngine;
 
     fn event() -> NormalizedEvent {
@@ -369,11 +394,11 @@ mod tests {
     }
 
     fn dispatcher() -> (
-        ActionDispatcher<BoundedRealtimeEventSink>,
+        ActionDispatcher<BoundedRealtimeEventSink, DisabledForwarder>,
         mpsc::Receiver<NormalizedEvent>,
     ) {
         let (sink, rx) = BoundedRealtimeEventSink::try_channel(1).unwrap();
-        (ActionDispatcher::new(sink), rx)
+        (ActionDispatcher::new(sink, DisabledForwarder), rx)
     }
 
     #[tokio::test]
@@ -472,6 +497,7 @@ mod tests {
         let (sink, _rx) = BoundedRealtimeEventSink::try_channel(1).unwrap();
         let dispatcher = ActionDispatcher::with_limits(
             sink,
+            DisabledForwarder,
             DispatchLimits {
                 max_intents_per_event: 1,
                 max_metadata_entries_per_event: 32,
@@ -504,6 +530,7 @@ mod tests {
         let (sink, _rx) = BoundedRealtimeEventSink::try_channel(1).unwrap();
         let dispatcher = ActionDispatcher::with_limits(
             sink,
+            DisabledForwarder,
             DispatchLimits {
                 max_intents_per_event: 128,
                 max_metadata_entries_per_event: 1,
@@ -646,5 +673,76 @@ mod tests {
             streamed.metadata.get("severity").map(String::as_str),
             Some("hot")
         );
+    }
+
+    #[test]
+    fn forward_to_sink_uses_enriched_snapshot_and_reports_local_acceptance() {
+        let event = event();
+        let sink_id = pipe_bolt_domain::SinkId::new("sink-1").unwrap();
+        let (realtime, _rx) = BoundedRealtimeEventSink::try_channel(1).unwrap();
+        let forwarder = RecordingForwarder::default();
+        let dispatcher = ActionDispatcher::new(realtime, forwarder.clone());
+
+        let outcome = dispatcher
+            .dispatch(
+                &event,
+                &[
+                    ActionIntent::AddMetadata {
+                        event_id: event.id.clone(),
+                        key: "severity".to_owned(),
+                        value: "hot".to_owned(),
+                    },
+                    ActionIntent::ForwardToSink {
+                        event_id: event.id.clone(),
+                        sink_id: sink_id.clone(),
+                        projection: None,
+                    },
+                ],
+            )
+            .unwrap();
+
+        assert!(outcome.failed.is_empty());
+        assert_eq!(outcome.executed.len(), 2);
+        assert_eq!(
+            forwarder.recorded()[0]
+                .event
+                .metadata
+                .get("severity")
+                .map(String::as_str),
+            Some("hot")
+        );
+        assert_eq!(
+            outcome.executed[1],
+            ExecutedAction::ForwardToSink {
+                receipt: ForwardReceipt {
+                    sink_id,
+                    accepted: true
+                }
+            }
+        );
+        assert!(event.metadata.is_empty());
+    }
+
+    #[derive(Clone, Default)]
+    struct RecordingForwarder {
+        requests: std::sync::Arc<std::sync::Mutex<Vec<ForwardRequest>>>,
+    }
+
+    impl RecordingForwarder {
+        fn recorded(&self) -> Vec<ForwardRequest> {
+            self.requests.lock().unwrap().clone()
+        }
+    }
+
+    impl EventForwarder for RecordingForwarder {
+        fn try_forward(&self, request: ForwardRequest) -> Result<ForwardReceipt, DispatchError> {
+            let sink_id = request.sink_id.clone();
+            self.requests.lock().unwrap().push(request);
+
+            Ok(ForwardReceipt {
+                sink_id,
+                accepted: true,
+            })
+        }
     }
 }

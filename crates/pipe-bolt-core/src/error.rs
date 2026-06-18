@@ -1,7 +1,7 @@
 use std::error::Error;
 use std::fmt::{Display, Formatter, Result};
 
-use pipe_bolt_domain::DomainError;
+use pipe_bolt_domain::{DomainError, SinkId};
 use thiserror::Error;
 
 /// Error type used by the MQTT core engine public API.
@@ -139,6 +139,27 @@ pub enum DispatchError {
 
     #[error("metadata value is too large: {actual} exceeds {max} bytes")]
     MetadataValueTooLarge { actual: usize, max: usize },
+
+    #[error("sink '{sink_id}' was not found")]
+    SinkNotFound { sink_id: SinkId },
+
+    #[error("sink '{sink_id}' is disabled")]
+    SinkDisabled { sink_id: SinkId },
+
+    #[error("sink '{sink_id}' uses an unsupported sink kind")]
+    UnsupportedSinkKind { sink_id: SinkId },
+
+    #[error("forwarder queue is unavailable")]
+    ForwarderUnavailable,
+
+    #[error("forwarder queue is full")]
+    ForwarderBackpressure,
+
+    #[error("forward payload serialization failed: {reason}")]
+    ForwardPayloadEncode { reason: &'static str },
+
+    #[error("forward payload is too large: {actual} exceeds {max} bytes")]
+    ForwardPayloadTooLarge { actual: usize, max: usize },
 }
 
 #[derive(Debug, Error, Clone, Eq, PartialEq)]
