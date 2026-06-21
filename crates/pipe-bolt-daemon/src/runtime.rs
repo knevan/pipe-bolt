@@ -11,8 +11,8 @@ use pipe_bolt_core::dispatcher::action::{
 };
 use pipe_bolt_core::error::{DispatchError, MqttEngineError};
 use pipe_bolt_core::forwarder::{
-    BoundedHttpForwarder, EgressPolicy, ForwardDeliveryOutcome, ForwardLimits, ForwarderStats,
-    ForwarderStatsSnapshot,
+    BoundedHttpForwarder, EgressPolicy, ForwardDeliveryOutcome, ForwardDeliveryStatus,
+    ForwardFailureReason, ForwardLimits, ForwarderStats, ForwarderStatsSnapshot,
 };
 use pipe_bolt_core::message::envelope::MqttMessage;
 use pipe_bolt_core::mqtt::engine::MqttEngine;
@@ -25,8 +25,12 @@ use pipe_bolt_core::web::realtime::router::{default_bind_addr, serve_realtime_br
 use pipe_bolt_core::web::realtime::state::RealtimeBridgeState;
 use pipe_bolt_domain::{
     ActionIntentTemplate, BackpressurePolicy, BrokerConnectionConfig, BrokerId, MqttQos,
-    NormalizedEvent, PayloadSchemaMapping, ProjectConfig, SinkKind, TlsMode, TopicRouteConfig,
+    NormalizedEvent, PayloadSchemaMapping, ProjectConfig, ProjectId, SinkKind, TlsMode,
+    TopicRouteConfig,
 };
+use pipe_bolt_storage::error::StorageError;
+use pipe_bolt_storage::model::{NewSinkDeliveryOutcome, SinkDeliveryStatus};
+use pipe_bolt_storage::postgres::PostgresStorage;
 use rumqttc::QoS;
 use thiserror::Error;
 use tokio::sync::{broadcast, mpsc, watch};
@@ -146,6 +150,7 @@ pub struct RuntimeStatsSnapshot {
     pub realtime_event_published_total: u64,
     pub realtime_event_no_receiver_total: u64,
     pub forward_outcome_total: u64,
+    pub delivery_outcome_persist_failed_total: u64,
 }
 
 #[derive(Debug, Default)]
@@ -157,6 +162,7 @@ pub struct RuntimeStats {
     realtime_event_published_total: AtomicU64,
     realtime_event_no_receiver_total: AtomicU64,
     forward_outcome_total: AtomicU64,
+    delivery_outcome_persist_failed_total: AtomicU64,
 }
 
 impl RuntimeStats {
@@ -173,6 +179,9 @@ impl RuntimeStats {
                 .realtime_event_no_receiver_total
                 .load(Ordering::Relaxed),
             forward_outcome_total: self.forward_outcome_total.load(Ordering::Relaxed),
+            delivery_outcome_persist_failed_total: self
+                .delivery_outcome_persist_failed_total
+                .load(Ordering::Relaxed),
         }
     }
 
@@ -204,6 +213,40 @@ impl RuntimeStats {
 
     fn record_forward_outcome(&self) {
         self.forward_outcome_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_delivery_outcome_persist_failure(&self) {
+        self.delivery_outcome_persist_failed_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[derive(Clone)]
+pub struct RuntimePersistence {
+    project_id: ProjectId,
+    storage: Arc<PostgresStorage>,
+}
+
+impl RuntimePersistence {
+    pub fn new(project_id: ProjectId, storage: Arc<PostgresStorage>) -> Self {
+        Self {
+            project_id,
+            storage,
+        }
+    }
+
+    async fn record_forward_delivery_outcome(
+        &self,
+        outcome: &ForwardDeliveryOutcome,
+    ) -> Result<String, StorageError> {
+        self.storage
+            .record_sink_delivery_outcome(NewSinkDeliveryOutcome {
+                project_id: self.project_id.clone(),
+                event_id: outcome.event_id.clone(),
+                sink_id: outcome.sink_id.clone(),
+                status: map_delivery_status(&outcome.status),
+            })
+            .await
     }
 }
 
@@ -244,6 +287,7 @@ impl ProjectRuntime {
     pub async fn start(
         config: ProjectConfig,
         settings: RuntimeSettings,
+        persistence: Option<RuntimePersistence>,
     ) -> Result<Self, RuntimeError> {
         validate_runtime_settings(&settings)?;
         validate_runtime_config(&config)?;
@@ -296,6 +340,7 @@ impl ProjectRuntime {
                 forward_outcomes,
                 shutdown_tx.subscribe(),
                 Arc::clone(&stats),
+                persistence,
             ),
         ));
 
@@ -616,6 +661,7 @@ async fn consume_forward_outcomes(
     mut outcomes: mpsc::Receiver<ForwardDeliveryOutcome>,
     mut shutdown_rx: watch::Receiver<bool>,
     stats: Arc<RuntimeStats>,
+    persistence: Option<RuntimePersistence>,
 ) -> Result<(), RuntimeError> {
     loop {
         tokio::select! {
@@ -633,20 +679,37 @@ async fn consume_forward_outcomes(
                     break;
                 };
 
-                record_forward_outcome(&stats, outcome);
+                record_forward_outcome(&stats, &persistence, outcome).await;
             }
         }
     }
 
     while let Some(outcome) = outcomes.recv().await {
-        record_forward_outcome(&stats, outcome);
+        record_forward_outcome(&stats, &persistence, outcome).await;
     }
 
     Ok(())
 }
 
-fn record_forward_outcome(stats: &RuntimeStats, outcome: ForwardDeliveryOutcome) {
+async fn record_forward_outcome(
+    stats: &RuntimeStats,
+    persistence: &Option<RuntimePersistence>,
+    outcome: ForwardDeliveryOutcome,
+) {
     stats.record_forward_outcome();
+
+    if let Some(persistence) = persistence {
+        if let Err(error) = persistence.record_forward_delivery_outcome(&outcome).await {
+            stats.record_delivery_outcome_persist_failure();
+            tracing::warn!(
+                event_id = %outcome.event_id,
+                sink_id = %outcome.sink_id,
+                error = %error,
+                "failed to persist forward delivery outcome"
+            );
+        }
+    }
+
     tracing::info!(
         event_id = %outcome.event_id,
         sink_id = %outcome.sink_id,
@@ -919,6 +982,41 @@ fn backpressure_policy_name(policy: BackpressurePolicy) -> &'static str {
 
 fn saturating_usize_to_u64(value: usize) -> u64 {
     u64::try_from(value).unwrap_or(u64::MAX)
+}
+
+fn map_delivery_status(status: &ForwardDeliveryStatus) -> SinkDeliveryStatus {
+    match status {
+        ForwardDeliveryStatus::Delivered {
+            http_status,
+            response_body_bytes,
+        } => SinkDeliveryStatus::Delivered {
+            http_status: *http_status,
+            response_body_bytes: *response_body_bytes,
+        },
+        ForwardDeliveryStatus::HttpRejected {
+            http_status,
+            response_body_bytes,
+        } => SinkDeliveryStatus::HttpRejected {
+            http_status: *http_status,
+            response_body_bytes: *response_body_bytes,
+        },
+        ForwardDeliveryStatus::TimedOut => SinkDeliveryStatus::TimedOut,
+        ForwardDeliveryStatus::ResponseTooLarge { max } => {
+            SinkDeliveryStatus::ResponseTooLarge { max: *max }
+        }
+        ForwardDeliveryStatus::Failed { reason } => SinkDeliveryStatus::Failed {
+            reason: forward_failure_reason_name(*reason).to_owned(),
+        },
+    }
+}
+
+fn forward_failure_reason_name(reason: ForwardFailureReason) -> &'static str {
+    match reason {
+        ForwardFailureReason::RequestFailed => "request_failed",
+        ForwardFailureReason::ResponseReadFailed => "response_read_failed",
+        ForwardFailureReason::WorkerJoinFailed => "worker_join_failed",
+        ForwardFailureReason::OutcomeReceiverClosed => "outcome_receiver_closed",
+    }
 }
 
 #[cfg(test)]

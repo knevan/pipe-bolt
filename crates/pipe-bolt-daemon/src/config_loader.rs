@@ -1,7 +1,8 @@
 ﻿use std::net::{AddrParseError, SocketAddr};
 use std::path::{Path, PathBuf};
 
-use pipe_bolt_domain::ProjectConfig;
+use pipe_bolt_domain::{ProjectConfig, ProjectId};
+use pipe_bolt_storage::error::StorageError;
 use thiserror::Error;
 use tokio::fs;
 use tokio::fs::File;
@@ -18,10 +19,22 @@ pub const DEFAULT_LOG_FILTER: &str = "pipe_bolt_daemon=info,pipe_bolt_core=info,
 const DEFAULT_MAX_PROJECT_CONFIG_BYTES: u64 = 1024 * 1024;
 const INITIAL_READ_BUFFER_BYTES: u64 = 64 * 1024;
 
+pub const DATABASE_URL_ENV: &str = "PIPE_BOLT_DATABASE_URL";
+pub const PROJECT_ID_ENV: &str = "PIPE_BOLT_PROJECT_ID";
+pub const STORAGE_KEY_B64_ENV: &str = "PIPE_BOLT_STORAGE_KEY_B64";
+pub const STORAGE_KEY_ID_ENV: &str = "PIPE_BOLT_STORAGE_KEY_ID";
+pub const STORAGE_MAX_CONNECTIONS_ENV: &str = "PIPE_BOLT_STORAGE_MAX_CONNECTIONS";
+pub const STORAGE_RUN_MIGRATIONS_ENV: &str = "PIPE_BOLT_STORAGE_RUN_MIGRATIONS";
+pub const PROJECT_CONFIG_BOOTSTRAP_ENV: &str = "PIPE_BOLT_PROJECT_CONFIG_BOOTSTRAP";
+
+pub const DEFAULT_STORAGE_KEY_ID: &str = "default";
+pub const DEFAULT_STORAGE_MAX_CONNECTIONS: u32 = 8;
+
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct DaemonRuntimeConfig {
-    pub project_config: ProjectConfigLoadOptions,
+    pub project_config: ProjectConfigSource,
     pub runtime: RuntimeSettings,
+    pub storage: Option<StorageRuntimeConfig>,
     pub log_filter: String,
 }
 
@@ -34,16 +47,92 @@ impl DaemonRuntimeConfig {
             runtime.realtime_bridge_bind_addr = parse_socket_addr(&value)?;
         }
 
+        let storage = StorageRuntimeConfig::from_env()?;
+        let project_config = ProjectConfigSource::from_env_and_args(storage.is_some())?;
         let log_filter = std::env::var(LOG_FILTER_ENV)
             .ok()
             .filter(|value| !value.trim().is_empty())
             .unwrap_or_else(|| DEFAULT_LOG_FILTER.to_owned());
 
         Ok(Self {
-            project_config: ProjectConfigLoadOptions::from_env_and_args()?,
+            project_config,
             runtime,
+            storage,
             log_filter,
         })
+    }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum ProjectConfigSource {
+    File(ProjectConfigLoadOptions),
+    Postgres {
+        project_id: ProjectId,
+        bootstrap_file: Option<ProjectConfigLoadOptions>,
+    },
+}
+
+impl ProjectConfigSource {
+    fn from_env_and_args(storage_enabled: bool) -> Result<Self, ConfigLoadError> {
+        if !storage_enabled {
+            return Ok(Self::File(ProjectConfigLoadOptions::from_env_and_args()?));
+        }
+
+        let project_id =
+            std::env::var(PROJECT_ID_ENV).map_err(|_| ConfigLoadError::MissingEnv {
+                name: PROJECT_ID_ENV,
+            })?;
+        let project_id = ProjectId::new(project_id)?;
+        let bootstrap_file = if env_bool(PROJECT_CONFIG_BOOTSTRAP_ENV, false)? {
+            Some(ProjectConfigLoadOptions::from_env_and_args()?)
+        } else {
+            None
+        };
+
+        Ok(Self::Postgres {
+            project_id,
+            bootstrap_file,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct StorageRuntimeConfig {
+    pub database_url: String,
+    pub secret_key_b64: String,
+    pub key_id: String,
+    pub max_connections: u32,
+    pub run_migrations: bool,
+}
+
+impl StorageRuntimeConfig {
+    fn from_env() -> Result<Option<Self>, ConfigLoadError> {
+        let Some(database_url) = std::env::var(DATABASE_URL_ENV)
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+        else {
+            return Ok(None);
+        };
+
+        let secret_key_b64 =
+            std::env::var(STORAGE_KEY_B64_ENV).map_err(|_| ConfigLoadError::MissingEnv {
+                name: STORAGE_KEY_B64_ENV,
+            })?;
+        let key_id = std::env::var(STORAGE_KEY_ID_ENV)
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| DEFAULT_STORAGE_KEY_ID.to_owned());
+        let max_connections =
+            env_u32(STORAGE_MAX_CONNECTIONS_ENV, DEFAULT_STORAGE_MAX_CONNECTIONS)?;
+        let run_migrations = env_bool(STORAGE_RUN_MIGRATIONS_ENV, true)?;
+
+        Ok(Some(Self {
+            database_url,
+            secret_key_b64,
+            key_id,
+            max_connections,
+            run_migrations,
+        }))
     }
 }
 
@@ -117,6 +206,21 @@ pub enum ConfigLoadError {
 
     #[error("project config validation failed: {0}")]
     Validation(#[from] pipe_bolt_domain::DomainError),
+
+    #[error("required environment variable {name} is missing")]
+    MissingEnv { name: &'static str },
+
+    #[error("environment variable {name} has invalid boolean value '{value}'")]
+    InvalidBool { name: &'static str, value: String },
+
+    #[error("environment variable {name} has invalid unsigned integer value '{value}'")]
+    InvalidU32 { name: &'static str, value: String },
+
+    #[error("project config '{project_id}' was not found in storage")]
+    ProjectConfigNotFound { project_id: String },
+
+    #[error("storage error: {0}")]
+    Storage(#[from] StorageError),
 }
 
 pub async fn load_project_config(
@@ -192,6 +296,28 @@ fn parse_socket_addr(value: &str) -> Result<SocketAddr, ConfigLoadError> {
             value: value.to_owned(),
             source,
         })
+}
+
+fn env_bool(name: &'static str, default: bool) -> Result<bool, ConfigLoadError> {
+    let Some(value) = std::env::var(name).ok() else {
+        return Ok(default);
+    };
+
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        _ => Err(ConfigLoadError::InvalidBool { name, value }),
+    }
+}
+
+fn env_u32(name: &'static str, default: u32) -> Result<u32, ConfigLoadError> {
+    let Some(value) = std::env::var(name).ok() else {
+        return Ok(default);
+    };
+
+    value
+        .parse::<u32>()
+        .map_err(|_| ConfigLoadError::InvalidU32 { name, value })
 }
 
 #[cfg(test)]

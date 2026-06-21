@@ -1,0 +1,30 @@
+[package]
+name = "pipe-bolt-storage"
+version = "0.1.0"
+edition = "2024"
+resolver = "3"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+pipe-bolt-domain = { path = "../pipe-bolt-domain" }
+
+aes-gcm = "0.10.3"
+base64 = "0.22.1"
+rand = "0.10.1"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+sqlx = { git = "https://github.com/transact-rs/sqlx", rev = "a4aeeb40153eb873a74d0ff82e2bb5f6be925f12", default-features = false, features = [
+    "runtime-tokio",
+    "tls-rustls",
+    "postgres",
+    "json",
+    "time",
+    "uuid",
+    "migrate",
+    "macros"
+] }
+thiserror = "2.0.18"
+time = { version = "0.3.49", features = ["serde", "serde-well-known"] }
+uuid = { version = "1.23.3", features = ["v7", "serde"] }

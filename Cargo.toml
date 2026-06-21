@@ -2,7 +2,9 @@
 resolver = "3"
 members = [
     "crates/pipe-bolt-core",
-    "crates/pipe-bolt-daemon", "crates/pipe-bolt-domain",
+    "crates/pipe-bolt-daemon",
+    "crates/pipe-bolt-domain",
+    "crates/pipe-bolt-storage",
 ]
 
 [profile.deployment]
@@ -17,3 +19,6 @@ lto = "thin"
 panic = "abort"
 codegen-units = 1
 incremental = false
+
+[profile.dev.package.sqlx-macros]
+opt-level = 3
