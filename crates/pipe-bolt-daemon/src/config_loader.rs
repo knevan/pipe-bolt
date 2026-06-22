@@ -29,6 +29,8 @@ pub const PROJECT_CONFIG_BOOTSTRAP_ENV: &str = "PIPE_BOLT_PROJECT_CONFIG_BOOTSTR
 
 pub const DEFAULT_STORAGE_KEY_ID: &str = "default";
 pub const DEFAULT_STORAGE_MAX_CONNECTIONS: u32 = 8;
+pub const STORAGE_ACTIVE_KEY_ID_ENV: &str = "PIPE_BOLT_STORAGE_ACTIVE_KEY_ID";
+pub const STORAGE_KEYS_ENV: &str = "PIPE_BOLT_STORAGE_KEYS";
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct DaemonRuntimeConfig {
@@ -99,8 +101,8 @@ impl ProjectConfigSource {
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct StorageRuntimeConfig {
     pub database_url: String,
-    pub secret_key_b64: String,
-    pub key_id: String,
+    pub active_key_id: String,
+    pub keys: Vec<(String, String)>,
     pub max_connections: u32,
     pub run_migrations: bool,
 }
@@ -114,22 +116,15 @@ impl StorageRuntimeConfig {
             return Ok(None);
         };
 
-        let secret_key_b64 =
-            std::env::var(STORAGE_KEY_B64_ENV).map_err(|_| ConfigLoadError::MissingEnv {
-                name: STORAGE_KEY_B64_ENV,
-            })?;
-        let key_id = std::env::var(STORAGE_KEY_ID_ENV)
-            .ok()
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or_else(|| DEFAULT_STORAGE_KEY_ID.to_owned());
         let max_connections =
             env_u32(STORAGE_MAX_CONNECTIONS_ENV, DEFAULT_STORAGE_MAX_CONNECTIONS)?;
         let run_migrations = env_bool(STORAGE_RUN_MIGRATIONS_ENV, true)?;
+        let (active_key_id, keys) = parse_storage_keys()?;
 
         Ok(Some(Self {
             database_url,
-            secret_key_b64,
-            key_id,
+            active_key_id,
+            keys,
             max_connections,
             run_migrations,
         }))
@@ -221,6 +216,12 @@ pub enum ConfigLoadError {
 
     #[error("storage error: {0}")]
     Storage(#[from] StorageError),
+
+    #[error("bootstrap project id mismatch: expected '{expected}', actual '{actual}'")]
+    ProjectIdMismatch { expected: String, actual: String },
+
+    #[error("invalid storage keyring config: {reason}")]
+    InvalidStorageKeyring { reason: &'static str },
 }
 
 pub async fn load_project_config(
@@ -287,6 +288,46 @@ async fn read_bounded_file(path: &Path, max_bytes: u64) -> Result<Vec<u8>, Confi
     }
 
     Ok(bytes)
+}
+
+fn parse_storage_keys() -> Result<(String, Vec<(String, String)>), ConfigLoadError> {
+    if let Ok(keys) = std::env::var(STORAGE_KEYS_ENV)
+        && !keys.trim().is_empty()
+    {
+        let active_key_id =
+            std::env::var(STORAGE_ACTIVE_KEY_ID_ENV).map_err(|_| ConfigLoadError::MissingEnv {
+                name: STORAGE_ACTIVE_KEY_ID_ENV,
+            })?;
+        let parsed = keys
+            .split(',')
+            .map(|entry| {
+                let (key_id, key_b64) =
+                    entry
+                        .split_once('=')
+                        .ok_or(ConfigLoadError::InvalidStorageKeyring {
+                            reason: "PIPE_BOLT_STORAGE_KEYS entries must use key_id=base64",
+                        })?;
+                if key_id.trim().is_empty() || key_b64.trim().is_empty() {
+                    return Err(ConfigLoadError::InvalidStorageKeyring {
+                        reason: "storage key id and key value must not be empty",
+                    });
+                }
+                Ok((key_id.trim().to_owned(), key_b64.trim().to_owned()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        return Ok((active_key_id, parsed));
+    }
+
+    let key_b64 = std::env::var(STORAGE_KEY_B64_ENV).map_err(|_| ConfigLoadError::MissingEnv {
+        name: STORAGE_KEY_B64_ENV,
+    })?;
+    let key_id = std::env::var(STORAGE_KEY_ID_ENV)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_STORAGE_KEY_ID.to_owned());
+
+    Ok((key_id.clone(), vec![(key_id, key_b64)]))
 }
 
 fn parse_socket_addr(value: &str) -> Result<SocketAddr, ConfigLoadError> {

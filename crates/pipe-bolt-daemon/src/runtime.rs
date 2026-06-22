@@ -11,8 +11,8 @@ use pipe_bolt_core::dispatcher::action::{
 };
 use pipe_bolt_core::error::{DispatchError, MqttEngineError};
 use pipe_bolt_core::forwarder::{
-    BoundedHttpForwarder, EgressPolicy, ForwardDeliveryOutcome, ForwardDeliveryStatus,
-    ForwardFailureReason, ForwardLimits, ForwarderStats, ForwarderStatsSnapshot,
+    BoundedHttpForwarder, EgressPolicy, ForwardDeliveryOutcome, ForwardLimits, ForwarderStats,
+    ForwarderStatsSnapshot,
 };
 use pipe_bolt_core::message::envelope::MqttMessage;
 use pipe_bolt_core::mqtt::engine::MqttEngine;
@@ -28,14 +28,17 @@ use pipe_bolt_domain::{
     NormalizedEvent, PayloadSchemaMapping, ProjectConfig, ProjectId, SinkKind, TlsMode,
     TopicRouteConfig,
 };
-use pipe_bolt_storage::error::StorageError;
-use pipe_bolt_storage::model::{NewSinkDeliveryOutcome, SinkDeliveryStatus};
 use pipe_bolt_storage::postgres::PostgresStorage;
 use rumqttc::QoS;
 use thiserror::Error;
 use tokio::sync::{broadcast, mpsc, watch};
 use tokio::task::{JoinError, JoinHandle};
 use tokio::time::timeout;
+
+use crate::persistence_writer::{
+    PersistenceWriterError, PersistenceWriterHandle, PersistenceWriterSettings,
+    PersistenceWriterStatsSnapshot, RuntimePersistenceWriter,
+};
 
 const DEFAULT_REALTIME_EVENT_CAPACITY: usize = 1024;
 const DEFAULT_WORKER_JOIN_TIMEOUT: Duration = Duration::from_secs(10);
@@ -139,6 +142,9 @@ pub enum RuntimeError {
         #[source]
         source: JoinError,
     },
+
+    #[error("persistence writer error: {0}")]
+    PersistenceWriter(#[from] PersistenceWriterError),
 }
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Default)]
@@ -214,17 +220,13 @@ impl RuntimeStats {
     fn record_forward_outcome(&self) {
         self.forward_outcome_total.fetch_add(1, Ordering::Relaxed);
     }
-
-    fn record_delivery_outcome_persist_failure(&self) {
-        self.delivery_outcome_persist_failed_total
-            .fetch_add(1, Ordering::Relaxed);
-    }
 }
 
 #[derive(Clone)]
 pub struct RuntimePersistence {
     project_id: ProjectId,
     storage: Arc<PostgresStorage>,
+    writer_settings: PersistenceWriterSettings,
 }
 
 impl RuntimePersistence {
@@ -232,21 +234,13 @@ impl RuntimePersistence {
         Self {
             project_id,
             storage,
+            writer_settings: PersistenceWriterSettings::default(),
         }
     }
 
-    async fn record_forward_delivery_outcome(
-        &self,
-        outcome: &ForwardDeliveryOutcome,
-    ) -> Result<String, StorageError> {
-        self.storage
-            .record_sink_delivery_outcome(NewSinkDeliveryOutcome {
-                project_id: self.project_id.clone(),
-                event_id: outcome.event_id.clone(),
-                sink_id: outcome.sink_id.clone(),
-                status: map_delivery_status(&outcome.status),
-            })
-            .await
+    pub fn with_writer_settings(mut self, writer_settings: PersistenceWriterSettings) -> Self {
+        self.writer_settings = writer_settings;
+        self
     }
 }
 
@@ -281,6 +275,7 @@ pub struct ProjectRuntime {
     forwarder_stats: Arc<ForwarderStats>,
     realtime_tx: broadcast::Sender<NormalizedEvent>,
     worker_join_timeout: Duration,
+    persistence_writer: Option<RuntimePersistenceWriter>,
 }
 
 impl ProjectRuntime {
@@ -329,6 +324,20 @@ impl ProjectRuntime {
             }
         }
 
+        let persistence_writer = persistence
+            .map(|persistence| {
+                RuntimePersistenceWriter::spawn(
+                    persistence.project_id,
+                    persistence.storage,
+                    persistence.writer_settings,
+                )
+            })
+            .transpose()?;
+
+        let persistence_handle = persistence_writer
+            .as_ref()
+            .map(RuntimePersistenceWriter::handle);
+
         let mut workers = Vec::new();
         workers.push(RuntimeWorker::spawn("forwarder", async move {
             forward_worker.run(shutdown_rx).await;
@@ -340,7 +349,7 @@ impl ProjectRuntime {
                 forward_outcomes,
                 shutdown_tx.subscribe(),
                 Arc::clone(&stats),
-                persistence,
+                persistence_handle,
             ),
         ));
 
@@ -369,6 +378,7 @@ impl ProjectRuntime {
             forwarder_stats,
             realtime_tx,
             worker_join_timeout: settings.worker_join_timeout,
+            persistence_writer,
         })
     }
 
@@ -384,15 +394,28 @@ impl ProjectRuntime {
         self.realtime_tx.subscribe()
     }
 
+    pub fn persistence_writer_stats(&self) -> Option<PersistenceWriterStatsSnapshot> {
+        self.persistence_writer
+            .as_ref()
+            .map(|writer| writer.handle().stats())
+    }
+
     pub async fn shutdown(self) -> Result<(), RuntimeError> {
         let Self {
             mqtt_engines,
             shutdown_tx,
             workers,
             worker_join_timeout,
+            persistence_writer,
             ..
         } = self;
         let mut first_error = None;
+
+        if let Some(writer) = persistence_writer
+            && let Err(error) = writer.shutdown().await
+        {
+            remember_first_error(&mut first_error, RuntimeError::from(error));
+        }
 
         for engine in mqtt_engines {
             if let Err(error) = engine.shutdown().await {
@@ -661,7 +684,7 @@ async fn consume_forward_outcomes(
     mut outcomes: mpsc::Receiver<ForwardDeliveryOutcome>,
     mut shutdown_rx: watch::Receiver<bool>,
     stats: Arc<RuntimeStats>,
-    persistence: Option<RuntimePersistence>,
+    persistence: Option<PersistenceWriterHandle>,
 ) -> Result<(), RuntimeError> {
     loop {
         tokio::select! {
@@ -679,35 +702,27 @@ async fn consume_forward_outcomes(
                     break;
                 };
 
-                record_forward_outcome(&stats, &persistence, outcome).await;
+                record_forward_outcome(&stats, persistence.as_ref(), &outcome);
             }
         }
     }
 
     while let Some(outcome) = outcomes.recv().await {
-        record_forward_outcome(&stats, &persistence, outcome).await;
+        record_forward_outcome(&stats, persistence.as_ref(), &outcome);
     }
 
     Ok(())
 }
 
-async fn record_forward_outcome(
+fn record_forward_outcome(
     stats: &RuntimeStats,
-    persistence: &Option<RuntimePersistence>,
-    outcome: ForwardDeliveryOutcome,
+    persistence: Option<&PersistenceWriterHandle>,
+    outcome: &ForwardDeliveryOutcome,
 ) {
     stats.record_forward_outcome();
 
     if let Some(persistence) = persistence {
-        if let Err(error) = persistence.record_forward_delivery_outcome(&outcome).await {
-            stats.record_delivery_outcome_persist_failure();
-            tracing::warn!(
-                event_id = %outcome.event_id,
-                sink_id = %outcome.sink_id,
-                error = %error,
-                "failed to persist forward delivery outcome"
-            );
-        }
+        persistence.try_record_forward_outcome(outcome);
     }
 
     tracing::info!(
@@ -982,41 +997,6 @@ fn backpressure_policy_name(policy: BackpressurePolicy) -> &'static str {
 
 fn saturating_usize_to_u64(value: usize) -> u64 {
     u64::try_from(value).unwrap_or(u64::MAX)
-}
-
-fn map_delivery_status(status: &ForwardDeliveryStatus) -> SinkDeliveryStatus {
-    match status {
-        ForwardDeliveryStatus::Delivered {
-            http_status,
-            response_body_bytes,
-        } => SinkDeliveryStatus::Delivered {
-            http_status: *http_status,
-            response_body_bytes: *response_body_bytes,
-        },
-        ForwardDeliveryStatus::HttpRejected {
-            http_status,
-            response_body_bytes,
-        } => SinkDeliveryStatus::HttpRejected {
-            http_status: *http_status,
-            response_body_bytes: *response_body_bytes,
-        },
-        ForwardDeliveryStatus::TimedOut => SinkDeliveryStatus::TimedOut,
-        ForwardDeliveryStatus::ResponseTooLarge { max } => {
-            SinkDeliveryStatus::ResponseTooLarge { max: *max }
-        }
-        ForwardDeliveryStatus::Failed { reason } => SinkDeliveryStatus::Failed {
-            reason: forward_failure_reason_name(*reason).to_owned(),
-        },
-    }
-}
-
-fn forward_failure_reason_name(reason: ForwardFailureReason) -> &'static str {
-    match reason {
-        ForwardFailureReason::RequestFailed => "request_failed",
-        ForwardFailureReason::ResponseReadFailed => "response_read_failed",
-        ForwardFailureReason::WorkerJoinFailed => "worker_join_failed",
-        ForwardFailureReason::OutcomeReceiverClosed => "outcome_receiver_closed",
-    }
 }
 
 #[cfg(test)]

@@ -1,18 +1,21 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use base64::Engine;
+use base64::prelude::BASE64_STANDARD_NO_PAD;
 use pipe_bolt_domain::{ProjectConfig, ProjectId};
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use sqlx::migrate::Migrator;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::types::Json;
-use sqlx::{PgPool, Postgres, Transaction};
+use sqlx::{PgPool, Postgres, Row, Transaction};
 use uuid::Uuid;
 
 use crate::error::StorageError;
 use crate::model::{
     AuditContext, AuditStatus, FailureSeverity, NewAuditEvent, NewFailureEvent,
-    NewSinkDeliveryOutcome, SinkDeliveryStatus,
+    NewSinkDeliveryOutcome, ProjectConfigWriteResult, RetentionConfig, SinkDeliveryStatus,
 };
 use crate::project_config_codec::{ProjectConfigCodec, StoredProjectConfig};
 use crate::secret::SecretCipher;
@@ -23,6 +26,13 @@ const DEFAULT_MAX_CONNECTIONS: u32 = 8;
 const DEFAULT_ACQUIRE_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 const DEFAULT_MAX_LIFETIME: Duration = Duration::from_secs(1800);
+
+const MAX_IDENTIFIER_BYTES: usize = 96;
+const MAX_TARGET_ID_BYTES: usize = 256;
+const MAX_REASON_BYTES: usize = 1024;
+const MAX_MESSAGE_BYTES: usize = 2048;
+const MAX_METADATA_JSON_BYTES: usize = 16 * 1024;
+const MAX_DETAILS_JSON_BYTES: usize = 16 * 1024;
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct PostgresStorageConfig {
@@ -92,80 +102,151 @@ impl PostgresStorage {
         &self,
         project_id: &ProjectId,
     ) -> Result<Option<ProjectConfig>, StorageError> {
-        // Pass arguments directly inside the sqlx::query! macro
-        let row = sqlx::query!(
-            "SELECT config FROM project_configs WHERE project_id = $1",
-            project_id.as_str()
-        )
-        .fetch_optional(&self.pool)
-        .await?;
+        let row = sqlx::query("SELECT config FROM project_configs WHERE project_id = $1")
+            .bind(project_id.as_str())
+            .fetch_optional(&self.pool)
+            .await?;
 
         let Some(row) = row else {
             return Ok(None);
         };
 
-        let stored: StoredProjectConfig = serde_json::from_value(row.config)?;
+        let config_json: serde_json::Value = row.try_get("config")?;
+        let stored = serde_json::from_value::<StoredProjectConfig>(config_json)?;
         let config = self.codec.decode(stored)?;
         Ok(Some(config))
     }
-    pub async fn upsert_project_config(
+
+    pub async fn create_project_config(
         &self,
         config: &ProjectConfig,
         audit: AuditContext,
-    ) -> Result<(), StorageError> {
+    ) -> Result<ProjectConfigWriteResult, StorageError> {
+        let mut config = config.clone();
+        if config.version == 0 {
+            config.version = 1;
+        }
         config.validate()?;
-        let stored = self.codec.encode(config)?;
-        let version = version_to_i64(config.version)?;
+
+        let encoded = self.encode_project_config(&config)?;
         let tenant_id = config.tenant_id.as_ref().map(ToString::to_string);
         let mut tx = self.pool.begin().await?;
 
-        sqlx::query!(
+        let result = sqlx::query(
             r#"
-            INSERT INTO project_configs (project_id, tenant_id, name, enabled, version, config)
-            VALUES ($1, $2, $3, $4, $5, $6)
-            ON CONFLICT (project_id) DO UPDATE SET
-                tenant_id = EXCLUDED.tenant_id,
-                name = EXCLUDED.name,
-                enabled = EXCLUDED.enabled,
-                version = EXCLUDED.version,
-                config = EXCLUDED.config,
-                updated_at = now()
+            INSERT INTO project_configs (project_id, tenant_id, name, enabled, version, config_hash, config)
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
+            ON CONFLICT (project_id) DO NOTHING
             "#,
-            config.id.as_str(),
-            tenant_id.as_deref(),
-            config.name.as_str(),
-            config.enabled,
-            version,
-            Json(stored) as _
         )
-        .execute(&mut *tx)
-        .await?;
+            .bind(config.id.as_str())
+            .bind(tenant_id.as_deref())
+            .bind(config.name.as_str())
+            .bind(config.enabled)
+            .bind(version_to_i64(config.version)?)
+            .bind(encoded.config_hash.as_str())
+            .bind(Json(encoded.config_json.clone()))
+            .execute(&mut *tx)
+            .await?;
 
-        let mut metadata = serde_json::Map::new();
-        metadata.insert("version".to_owned(), json!(config.version));
-        insert_audit_event_tx(
+        if result.rows_affected() == 0 {
+            let actual_version = current_project_version_tx(&mut tx, &config.id).await?;
+            return Err(StorageError::VersionConflict {
+                project_id: config.id.to_string(),
+                expected_version: None,
+                actual_version,
+            });
+        }
+
+        let write = insert_config_revision_tx(&mut tx, &config, &encoded, &audit).await?;
+        insert_config_audit_tx(
             &mut tx,
-            NewAuditEvent {
-                project_id: Some(config.id.clone()),
-                actor_id: audit.actor_id,
-                action: "project_config.upsert".to_owned(),
-                target_type: "project_config".to_owned(),
-                target_id: config.id.to_string(),
-                status: AuditStatus::Succeeded,
-                reason: audit.reason,
-                metadata,
-            },
+            &config,
+            &write,
+            None,
+            audit,
+            "project_config.create",
         )
         .await?;
 
         tx.commit().await?;
-        Ok(())
+        Ok(write)
+    }
+
+    pub async fn update_project_config(
+        &self,
+        config: &ProjectConfig,
+        expected_version: u64,
+        audit: AuditContext,
+    ) -> Result<ProjectConfigWriteResult, StorageError> {
+        let next_version =
+            expected_version
+                .checked_add(1)
+                .ok_or(StorageError::VersionOverflow {
+                    version: expected_version,
+                })?;
+        let mut config = config.clone();
+        config.version = next_version;
+        config.validate()?;
+
+        let encoded = self.encode_project_config(&config)?;
+        let tenant_id = config.tenant_id.as_ref().map(ToString::to_string);
+        let mut tx = self.pool.begin().await?;
+
+        let result = sqlx::query(
+            r#"
+            UPDATE project_configs
+            SET tenant_id = $2,
+                name = $3,
+                enabled = $4,
+                version = $5,
+                config_hash = $6,
+                config = $7,
+                updated_at = now()
+            WHERE project_id = $1 AND version = $8
+            "#,
+        )
+        .bind(config.id.as_str())
+        .bind(tenant_id.as_deref())
+        .bind(config.name.as_str())
+        .bind(config.enabled)
+        .bind(version_to_i64(next_version)?)
+        .bind(encoded.config_hash.as_str())
+        .bind(Json(encoded.config_json.clone()))
+        .bind(version_to_i64(expected_version)?)
+        .execute(&mut *tx)
+        .await?;
+
+        if result.rows_affected() == 0 {
+            let actual_version = current_project_version_tx(&mut tx, &config.id).await?;
+            return Err(StorageError::VersionConflict {
+                project_id: config.id.to_string(),
+                expected_version: Some(expected_version),
+                actual_version,
+            });
+        }
+
+        let write = insert_config_revision_tx(&mut tx, &config, &encoded, &audit).await?;
+        insert_config_audit_tx(
+            &mut tx,
+            &config,
+            &write,
+            Some(expected_version),
+            audit,
+            "project_config.update",
+        )
+        .await?;
+
+        tx.commit().await?;
+        Ok(write)
     }
 
     pub async fn record_sink_delivery_outcome(
         &self,
         outcome: NewSinkDeliveryOutcome,
     ) -> Result<String, StorageError> {
+        validate_sink_delivery_outcome(&outcome)?;
+
         let delivery_id = generated_id("delivery");
         let status_name = outcome.status.name();
         let http_status = delivery_http_status(&outcome.status).map(i32::from);
@@ -173,25 +254,34 @@ impl PostgresStorage {
             .map(|value| usize_to_i64("response_body_bytes", value))
             .transpose()?;
         let failure_reason = delivery_failure_reason(&outcome.status);
+        let duration_ms = outcome
+            .duration_ms
+            .map(|value| u64_to_i64("duration_ms", value))
+            .transpose()?;
+        let attempt = i32::from(outcome.attempt.max(1));
         let mut tx = self.pool.begin().await?;
 
-        sqlx::query!(
+        sqlx::query(
             r#"
             INSERT INTO sink_delivery_outcomes (
                 delivery_id, project_id, event_id, sink_id, status,
-                http_status, response_body_bytes, failure_reason
+                http_status, response_body_bytes, failure_reason,
+                correlation_id, duration_ms, attempt
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
             "#,
-            delivery_id.as_str(),
-            outcome.project_id.as_str(),
-            outcome.event_id.as_str(),
-            outcome.sink_id.as_str(),
-            status_name,
-            http_status,
-            response_body_bytes,
-            failure_reason.as_deref()
         )
+        .bind(delivery_id.as_str())
+        .bind(outcome.project_id.as_str())
+        .bind(outcome.event_id.as_str())
+        .bind(outcome.sink_id.as_str())
+        .bind(status_name)
+        .bind(http_status)
+        .bind(response_body_bytes)
+        .bind(failure_reason.as_deref())
+        .bind(outcome.correlation_id.as_deref())
+        .bind(duration_ms)
+        .bind(attempt)
         .execute(&mut *tx)
         .await?;
 
@@ -201,6 +291,9 @@ impl PostgresStorage {
             details.insert("status".to_owned(), json!(status_name));
             if let Some(reason) = &failure_reason {
                 details.insert("reason".to_owned(), json!(reason));
+            }
+            if let Some(correlation_id) = &outcome.correlation_id {
+                details.insert("correlation_id".to_owned(), json!(correlation_id));
             }
 
             insert_failure_event_tx(
@@ -246,35 +339,34 @@ impl PostgresStorage {
         resolution: &str,
         audit: AuditContext,
     ) -> Result<(), StorageError> {
-        if failure_id.trim().is_empty() || resolution.trim().is_empty() {
-            return Err(StorageError::InvalidConfig {
-                reason: "failure_id and resolution must not be empty",
-            });
-        }
+        validate_bounded_text("failure_id", failure_id, MAX_TARGET_ID_BYTES)?;
+        validate_bounded_text("resolution", resolution, MAX_MESSAGE_BYTES)?;
 
         let mut tx = self.pool.begin().await?;
-        let result = sqlx::query(
+        let row = sqlx::query(
             r#"
             UPDATE failure_events
             SET resolved_at = now(), resolution = $2
             WHERE failure_id = $1 AND resolved_at IS NULL
+            RETURNING project_id
             "#,
         )
         .bind(failure_id)
         .bind(resolution)
-        .execute(&mut *tx)
+        .fetch_optional(&mut *tx)
         .await?;
 
-        if result.rows_affected() == 0 {
+        let Some(row) = row else {
             return Err(StorageError::InvalidStoredState {
                 reason: "failure was not found or already resolved",
             });
-        }
+        };
 
+        let project_id = ProjectId::new(row.try_get::<String, _>("project_id")?)?;
         insert_audit_event_tx(
             &mut tx,
             NewAuditEvent {
-                project_id: None,
+                project_id: Some(project_id),
                 actor_id: audit.actor_id,
                 action: "failure.resolve".to_owned(),
                 target_type: "failure".to_owned(),
@@ -289,15 +381,143 @@ impl PostgresStorage {
         tx.commit().await?;
         Ok(())
     }
+
+    pub async fn delete_expired_operational_rows(
+        &self,
+        project_id: &ProjectId,
+        retention: RetentionConfig,
+    ) -> Result<(), StorageError> {
+        validate_retention(retention)?;
+
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            "DELETE FROM audit_events WHERE project_id = $1 AND occurred_at < now() - ($2::int * interval '1 day')",
+        )
+            .bind(project_id.as_str())
+            .bind(i32::from(retention.audit_retention_days))
+            .execute(&mut *tx)
+            .await?;
+
+        sqlx::query(
+            "DELETE FROM sink_delivery_outcomes WHERE project_id = $1 AND occurred_at < now() - ($2::int * interval '1 day')",
+        )
+            .bind(project_id.as_str())
+            .bind(i32::from(retention.delivery_outcome_retention_days))
+            .execute(&mut *tx)
+            .await?;
+
+        sqlx::query(
+            "DELETE FROM failure_events WHERE project_id = $1 AND occurred_at < now() - ($2::int * interval '1 day') AND resolved_at IS NOT NULL",
+        )
+            .bind(project_id.as_str())
+            .bind(i32::from(retention.failure_retention_days))
+            .execute(&mut *tx)
+            .await?;
+
+        tx.commit().await?;
+        Ok(())
+    }
+
+    fn encode_project_config(
+        &self,
+        config: &ProjectConfig,
+    ) -> Result<EncodedProjectConfig, StorageError> {
+        let stored = self.codec.encode(config)?;
+        let config_json = serde_json::to_value(stored)?;
+        let config_hash = hash_config_json(&config_json)?;
+
+        Ok(EncodedProjectConfig {
+            config_json,
+            config_hash,
+        })
+    }
+}
+
+struct EncodedProjectConfig {
+    config_json: serde_json::Value,
+    config_hash: String,
+}
+
+async fn insert_config_revision_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    config: &ProjectConfig,
+    encoded: &EncodedProjectConfig,
+    audit: &AuditContext,
+) -> Result<ProjectConfigWriteResult, StorageError> {
+    let revision_id = generated_id("config_revision");
+    let actor_id = audit.actor_id.as_ref().map(ToString::to_string);
+
+    sqlx::query(
+        r#"
+        INSERT INTO project_config_revisions (
+            revision_id, project_id, version, config_hash, config, actor_id, reason
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        "#,
+    )
+    .bind(revision_id.as_str())
+    .bind(config.id.as_str())
+    .bind(version_to_i64(config.version)?)
+    .bind(encoded.config_hash.as_str())
+    .bind(Json(encoded.config_json.clone()))
+    .bind(actor_id.as_deref())
+    .bind(audit.reason.as_deref())
+    .execute(&mut **tx)
+    .await?;
+
+    Ok(ProjectConfigWriteResult {
+        project_id: config.id.clone(),
+        version: config.version,
+        revision_id,
+        config_hash: encoded.config_hash.clone(),
+    })
+}
+
+async fn insert_config_audit_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    config: &ProjectConfig,
+    write: &ProjectConfigWriteResult,
+    expected_version: Option<u64>,
+    audit: AuditContext,
+    action: &str,
+) -> Result<(), StorageError> {
+    let mut metadata = serde_json::Map::new();
+    metadata.insert("version".to_owned(), json!(write.version));
+    metadata.insert("revision_id".to_owned(), json!(write.revision_id));
+    metadata.insert("config_hash".to_owned(), json!(write.config_hash));
+    if let Some(expected_version) = expected_version {
+        metadata.insert("expected_version".to_owned(), json!(expected_version));
+    }
+
+    insert_audit_event_tx(
+        tx,
+        NewAuditEvent {
+            project_id: Some(config.id.clone()),
+            actor_id: audit.actor_id,
+            action: action.to_owned(),
+            target_type: "project_config".to_owned(),
+            target_id: config.id.to_string(),
+            status: AuditStatus::Succeeded,
+            reason: audit.reason,
+            metadata,
+        },
+    )
+    .await?;
+
+    Ok(())
 }
 
 async fn insert_audit_event_tx(
     tx: &mut Transaction<'_, Postgres>,
     event: NewAuditEvent,
 ) -> Result<String, StorageError> {
-    validate_non_empty("action", &event.action)?;
-    validate_non_empty("target_type", &event.target_type)?;
-    validate_non_empty("target_id", &event.target_id)?;
+    validate_identifier("action", &event.action)?;
+    validate_identifier("target_type", &event.target_type)?;
+    validate_bounded_text("target_id", &event.target_id, MAX_TARGET_ID_BYTES)?;
+    if let Some(reason) = &event.reason {
+        validate_bounded_text("reason", reason, MAX_REASON_BYTES)?;
+    }
+    validate_json_object_size("metadata", &event.metadata, MAX_METADATA_JSON_BYTES)?;
 
     let audit_event_id = generated_id("audit");
     let project_id = event.project_id.as_ref().map(ToString::to_string);
@@ -331,9 +551,10 @@ async fn insert_failure_event_tx(
     tx: &mut Transaction<'_, Postgres>,
     event: NewFailureEvent,
 ) -> Result<String, StorageError> {
-    validate_non_empty("component", &event.component)?;
-    validate_non_empty("failure_kind", &event.failure_kind)?;
-    validate_non_empty("message", &event.message)?;
+    validate_identifier("component", &event.component)?;
+    validate_identifier("failure_kind", &event.failure_kind)?;
+    validate_bounded_text("message", &event.message, MAX_MESSAGE_BYTES)?;
+    validate_json_object_size("details", &event.details, MAX_DETAILS_JSON_BYTES)?;
 
     let failure_id = generated_id("failure");
 
@@ -360,6 +581,20 @@ async fn insert_failure_event_tx(
 
     Ok(failure_id)
 }
+
+async fn current_project_version_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    project_id: &ProjectId,
+) -> Result<Option<u64>, StorageError> {
+    let row = sqlx::query("SELECT version FROM project_configs WHERE project_id = $1")
+        .bind(project_id.as_str())
+        .fetch_optional(&mut **tx)
+        .await?;
+
+    row.map(|row| i64_to_u64("version", row.try_get::<i64, _>("version")?))
+        .transpose()
+}
+
 fn validate_config(config: &PostgresStorageConfig) -> Result<(), StorageError> {
     if config.database_url.trim().is_empty() {
         return Err(StorageError::InvalidConfig {
@@ -382,11 +617,84 @@ fn validate_config(config: &PostgresStorageConfig) -> Result<(), StorageError> {
     Ok(())
 }
 
-fn validate_non_empty(field: &'static str, value: &str) -> Result<(), StorageError> {
-    if value.trim().is_empty() {
-        return Err(StorageError::InvalidConfig { reason: field });
+fn validate_sink_delivery_outcome(outcome: &NewSinkDeliveryOutcome) -> Result<(), StorageError> {
+    if let Some(correlation_id) = &outcome.correlation_id {
+        validate_bounded_text("correlation_id", correlation_id, MAX_TARGET_ID_BYTES)?;
+    }
+    if let SinkDeliveryStatus::Failed { reason } = &outcome.status {
+        validate_bounded_text("failure_reason", reason, MAX_REASON_BYTES)?;
     }
     Ok(())
+}
+
+fn validate_retention(retention: RetentionConfig) -> Result<(), StorageError> {
+    if retention.audit_retention_days == 0
+        || retention.delivery_outcome_retention_days == 0
+        || retention.failure_retention_days == 0
+    {
+        return Err(StorageError::InvalidConfig {
+            reason: "retention days must be greater than zero",
+        });
+    }
+    Ok(())
+}
+
+fn validate_identifier(field: &'static str, value: &str) -> Result<(), StorageError> {
+    validate_bounded_text(field, value, MAX_IDENTIFIER_BYTES)?;
+    if !value
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.' | b':'))
+    {
+        return Err(StorageError::InvalidField {
+            field,
+            reason: "identifier contains unsupported characters",
+        });
+    }
+    Ok(())
+}
+
+fn validate_bounded_text(
+    field: &'static str,
+    value: &str,
+    max_bytes: usize,
+) -> Result<(), StorageError> {
+    if value.trim().is_empty() {
+        return Err(StorageError::InvalidField {
+            field,
+            reason: "must not be empty",
+        });
+    }
+    let actual_bytes = value.len();
+    if actual_bytes > max_bytes {
+        return Err(StorageError::FieldTooLarge {
+            field,
+            actual_bytes,
+            max_bytes,
+        });
+    }
+    Ok(())
+}
+
+fn validate_json_object_size(
+    field: &'static str,
+    value: &serde_json::Map<String, serde_json::Value>,
+    max_bytes: usize,
+) -> Result<(), StorageError> {
+    let actual_bytes = serde_json::to_vec(value)?.len();
+    if actual_bytes > max_bytes {
+        return Err(StorageError::FieldTooLarge {
+            field,
+            actual_bytes,
+            max_bytes,
+        });
+    }
+    Ok(())
+}
+
+fn hash_config_json(config_json: &serde_json::Value) -> Result<String, StorageError> {
+    let bytes = serde_json::to_vec(config_json)?;
+    let digest = Sha256::digest(bytes);
+    Ok(format!("sha256:{}", BASE64_STANDARD_NO_PAD.encode(digest)))
 }
 
 fn generated_id(prefix: &str) -> String {
@@ -397,7 +705,15 @@ fn version_to_i64(version: u64) -> Result<i64, StorageError> {
     i64::try_from(version).map_err(|_| StorageError::VersionOverflow { version })
 }
 
+fn i64_to_u64(field: &'static str, value: i64) -> Result<u64, StorageError> {
+    u64::try_from(value).map_err(|_| StorageError::NumericOverflow { field })
+}
+
 fn usize_to_i64(field: &'static str, value: usize) -> Result<i64, StorageError> {
+    i64::try_from(value).map_err(|_| StorageError::NumericOverflow { field })
+}
+
+fn u64_to_i64(field: &'static str, value: u64) -> Result<i64, StorageError> {
     i64::try_from(value).map_err(|_| StorageError::NumericOverflow { field })
 }
 

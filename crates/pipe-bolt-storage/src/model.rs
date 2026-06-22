@@ -16,6 +16,14 @@ impl AuditContext {
     }
 }
 
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct ProjectConfigWriteResult {
+    pub project_id: ProjectId,
+    pub version: u64,
+    pub revision_id: String,
+    pub config_hash: String,
+}
+
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 pub enum AuditStatus {
     Succeeded,
@@ -85,6 +93,9 @@ pub struct NewSinkDeliveryOutcome {
     pub event_id: EventId,
     pub sink_id: SinkId,
     pub status: SinkDeliveryStatus,
+    pub correlation_id: Option<String>,
+    pub duration_ms: Option<u64>,
+    pub attempt: u16,
 }
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
@@ -114,4 +125,21 @@ pub struct NewFailureEvent {
     pub severity: FailureSeverity,
     pub message: String,
     pub details: serde_json::Map<String, serde_json::Value>,
+}
+
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub struct RetentionConfig {
+    pub audit_retention_days: u16,
+    pub delivery_outcome_retention_days: u16,
+    pub failure_retention_days: u16,
+}
+
+impl Default for RetentionConfig {
+    fn default() -> Self {
+        Self {
+            audit_retention_days: 365,
+            delivery_outcome_retention_days: 90,
+            failure_retention_days: 365,
+        }
+    }
 }

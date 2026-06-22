@@ -13,6 +13,7 @@
 )]
 
 pub mod config_loader;
+pub mod persistence_writer;
 pub mod runtime;
 
 use std::error::Error;
@@ -23,7 +24,7 @@ use dotenvy::dotenv;
 use pipe_bolt_domain::ProjectConfig;
 use pipe_bolt_storage::model::AuditContext;
 use pipe_bolt_storage::postgres::{PostgresStorage, PostgresStorageConfig};
-use pipe_bolt_storage::secret::AesGcmSecretCipher;
+use pipe_bolt_storage::secret::StorageKeyring;
 
 use crate::config_loader::{
     ConfigLoadError, DaemonRuntimeConfig, ProjectConfigSource, StorageRuntimeConfig,
@@ -64,13 +65,13 @@ async fn build_storage(
         return Ok(None);
     };
 
-    let cipher = Arc::new(AesGcmSecretCipher::from_base64_key(
-        config.key_id.clone(),
-        &config.secret_key_b64,
+    let keyring = Arc::new(StorageKeyring::from_base64_keys(
+        config.active_key_id.clone(),
+        config.keys.clone(),
     )?);
     let mut storage_config = PostgresStorageConfig::new(config.database_url.clone())?;
     storage_config.max_connections = config.max_connections;
-    let storage = Arc::new(PostgresStorage::connect(&storage_config, cipher).await?);
+    let storage = Arc::new(PostgresStorage::connect(&storage_config, keyring).await?);
 
     if config.run_migrations {
         storage.migrate().await?;
@@ -104,15 +105,33 @@ async fn load_config(
             };
 
             let config = load_project_config(options).await?;
+
+            validate_bootstrap_project_id(&config, project_id)?;
+
             storage
-                .upsert_project_config(
+                .create_project_config(
                     &config,
                     AuditContext::system("bootstrap project config from file"),
                 )
                 .await?;
+
             Ok(config)
         }
     }
+}
+
+fn validate_bootstrap_project_id(
+    config: &ProjectConfig,
+    expected_project_id: &pipe_bolt_domain::ProjectId,
+) -> Result<(), ConfigLoadError> {
+    if config.id != *expected_project_id {
+        return Err(ConfigLoadError::ProjectIdMismatch {
+            expected: expected_project_id.to_string(),
+            actual: config.id.to_string(),
+        });
+    }
+
+    Ok(())
 }
 
 /// Initializes the tracing subscriber with EnvFilter support
@@ -122,4 +141,33 @@ fn init_tracing(filter: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
         .with_env_filter(env_filter)
         .try_init()?;
     Ok(())
+}
+
+#[cfg(test)]
+/// Helper to construct a project config for testing purposes
+fn test_project_config(id: &str) -> ProjectConfig {
+    ProjectConfig {
+        id: pipe_bolt_domain::ProjectId::new(id).expect("project id"),
+        tenant_id: None,
+        name: "Test Project".to_owned(),
+        description: None,
+        enabled: true,
+        version: 1,
+        brokers: Vec::new(),
+        routes: Vec::new(),
+        schema_mappings: Vec::new(),
+        rules: Vec::new(),
+        command_templates: Vec::new(),
+        sinks: Vec::new(),
+    }
+}
+
+#[test]
+fn bootstrap_rejects_file_with_different_project_id() {
+    let config = test_project_config("project-file");
+    let expected = pipe_bolt_domain::ProjectId::new("project-env").expect("project id");
+
+    let error = validate_bootstrap_project_id(&config, &expected).expect_err("mismatch error");
+
+    assert!(matches!(error, ConfigLoadError::ProjectIdMismatch { .. }));
 }
