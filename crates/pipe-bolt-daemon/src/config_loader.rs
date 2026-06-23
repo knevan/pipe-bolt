@@ -31,35 +31,43 @@ pub const DEFAULT_STORAGE_KEY_ID: &str = "default";
 pub const DEFAULT_STORAGE_MAX_CONNECTIONS: u32 = 8;
 pub const STORAGE_ACTIVE_KEY_ID_ENV: &str = "PIPE_BOLT_STORAGE_ACTIVE_KEY_ID";
 pub const STORAGE_KEYS_ENV: &str = "PIPE_BOLT_STORAGE_KEYS";
+pub const MANAGEMENT_API_ENABLED_ENV: &str = "PIPE_BOLT_MANAGEMENT_API_ENABLED";
+pub const MANAGEMENT_API_BIND_ADDR_ENV: &str = "PIPE_BOLT_MANAGEMENT_BIND_ADDR";
+pub const MANAGEMENT_API_TOKEN_ENV: &str = "PIPE_BOLT_MANAGEMENT_TOKEN";
+pub const MANAGEMENT_API_MAX_CONFIG_BYTES_ENV: &str = "PIPE_BOLT_MANAGEMENT_MAX_CONFIG_BYTES";
+pub const DEFAULT_MANAGEMENT_API_BIND_ADDR: &str = "127.0.0.1:8081";
+
+const DEFAULT_MANAGEMENT_API_MAX_CONFIG_BYTES: usize = 1024 * 1024;
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct DaemonRuntimeConfig {
     pub project_config: ProjectConfigSource,
     pub runtime: RuntimeSettings,
     pub storage: Option<StorageRuntimeConfig>,
+    pub management_api: Option<ManagementApiRuntimeConfig>,
     pub log_filter: String,
 }
 
 impl DaemonRuntimeConfig {
     pub fn from_env_and_args() -> Result<Self, ConfigLoadError> {
         let mut runtime = RuntimeSettings::default();
-
         if let Some(value) = std::env::var_os(REALTIME_BIND_ADDR_ENV) {
             let value = value.to_string_lossy().into_owned();
             runtime.realtime_bridge_bind_addr = parse_socket_addr(&value)?;
         }
-
         let storage = StorageRuntimeConfig::from_env()?;
-        let project_config = ProjectConfigSource::from_env_and_args(storage.is_some())?;
+        let storage_enabled = storage.is_some();
+        let management_api = ManagementApiRuntimeConfig::from_env(storage_enabled)?;
+        let project_config = ProjectConfigSource::from_env_and_args(storage_enabled)?;
         let log_filter = std::env::var(LOG_FILTER_ENV)
             .ok()
             .filter(|value| !value.trim().is_empty())
             .unwrap_or_else(|| DEFAULT_LOG_FILTER.to_owned());
-
         Ok(Self {
             project_config,
             runtime,
             storage,
+            management_api,
             log_filter,
         })
     }
@@ -132,6 +140,54 @@ impl StorageRuntimeConfig {
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
+pub struct ManagementApiRuntimeConfig {
+    pub bind_addr: SocketAddr,
+    pub bearer_token: String,
+    pub max_config_body_bytes: usize,
+}
+
+impl ManagementApiRuntimeConfig {
+    fn from_env(storage_enabled: bool) -> Result<Option<Self>, ConfigLoadError> {
+        let enabled = env_bool(MANAGEMENT_API_ENABLED_ENV, storage_enabled)?;
+        if !enabled {
+            return Ok(None);
+        }
+
+        if !storage_enabled {
+            return Err(ConfigLoadError::InvalidOptions(
+                "management API requires PostgreSQL storage",
+            ));
+        }
+
+        let bind_addr = std::env::var(MANAGEMENT_API_BIND_ADDR_ENV)
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| DEFAULT_MANAGEMENT_API_BIND_ADDR.to_owned());
+        let bearer_token =
+            std::env::var(MANAGEMENT_API_TOKEN_ENV).map_err(|_| ConfigLoadError::MissingEnv {
+                name: MANAGEMENT_API_TOKEN_ENV,
+            })?;
+
+        if bearer_token.trim().is_empty() {
+            return Err(ConfigLoadError::InvalidOptions(
+                "management API bearer token must not be empty",
+            ));
+        }
+
+        let max_config_body_bytes = env_usize(
+            MANAGEMENT_API_MAX_CONFIG_BYTES_ENV,
+            DEFAULT_MANAGEMENT_API_MAX_CONFIG_BYTES,
+        )?;
+
+        Ok(Some(Self {
+            bind_addr: parse_socket_addr(&bind_addr)?,
+            bearer_token,
+            max_config_body_bytes,
+        }))
+    }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub struct ProjectConfigLoadOptions {
     pub path: PathBuf,
     pub max_bytes: u64,
@@ -139,13 +195,15 @@ pub struct ProjectConfigLoadOptions {
 
 impl ProjectConfigLoadOptions {
     pub fn from_env_and_args() -> Result<Self, ConfigLoadError> {
-        let path = std::env::args_os()
-            .nth(1)
-            .or_else(|| std::env::var_os(PROJECT_CONFIG_ENV))
+        let path = std::env::var(PROJECT_CONFIG_ENV)
+            .ok()
+            .filter(|value| !value.trim().is_empty())
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(DEFAULT_PROJECT_CONFIG_PATH));
-
-        Self::new(path, DEFAULT_MAX_PROJECT_CONFIG_BYTES)
+        Ok(Self {
+            path,
+            max_bytes: DEFAULT_MAX_PROJECT_CONFIG_BYTES,
+        })
     }
 
     pub fn new(path: impl Into<PathBuf>, max_bytes: u64) -> Result<Self, ConfigLoadError> {
@@ -222,6 +280,9 @@ pub enum ConfigLoadError {
 
     #[error("invalid storage keyring config: {reason}")]
     InvalidStorageKeyring { reason: &'static str },
+
+    #[error("environment variable {name} has invalid usize value '{value}'")]
+    InvalidUsize { name: &'static str, value: String },
 }
 
 pub async fn load_project_config(
@@ -359,6 +420,16 @@ fn env_u32(name: &'static str, default: u32) -> Result<u32, ConfigLoadError> {
     value
         .parse::<u32>()
         .map_err(|_| ConfigLoadError::InvalidU32 { name, value })
+}
+
+fn env_usize(name: &'static str, default: usize) -> Result<usize, ConfigLoadError> {
+    let Some(value) = std::env::var(name).ok() else {
+        return Ok(default);
+    };
+
+    value
+        .parse::<usize>()
+        .map_err(|_| ConfigLoadError::InvalidUsize { name, value })
 }
 
 #[cfg(test)]

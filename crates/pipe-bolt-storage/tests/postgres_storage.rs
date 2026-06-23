@@ -137,6 +137,7 @@ async fn resolve_failure_sets_project_scoped_audit_event() {
 
     storage
         .resolve_failure(
+            &config.id,
             &failure_id,
             "resolved by test",
             AuditContext::system("test resolve"),

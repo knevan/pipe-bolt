@@ -1,0 +1,21 @@
+[package]
+name = "pipe-bolt-api"
+version = "0.1.0"
+edition = "2024"
+resolver = "3"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+pipe-bolt-domain = { path = "../pipe-bolt-domain" }
+pipe-bolt-storage = { path = "../pipe-bolt-storage" }
+
+salvo = { version = "0.93.0", features = ["affix-state"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+thiserror = "2.0.18"
+tracing = "0.1.44"
+time = { version = "0.3.49", features = ["formatting", "parsing", "serde", "serde-well-known"] }
+tokio = { version = "1.52.3", features = ["sync"] }
+subtle = "2.6.1"

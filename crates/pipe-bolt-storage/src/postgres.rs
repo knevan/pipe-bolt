@@ -3,19 +3,20 @@ use std::time::Duration;
 
 use base64::Engine;
 use base64::prelude::BASE64_STANDARD_NO_PAD;
-use pipe_bolt_domain::{ProjectConfig, ProjectId};
+use pipe_bolt_domain::{EventId, ProjectConfig, ProjectId, SinkId, UserId};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use sqlx::migrate::Migrator;
-use sqlx::postgres::PgPoolOptions;
+use sqlx::postgres::{PgPoolOptions, PgRow};
 use sqlx::types::Json;
 use sqlx::{PgPool, Postgres, Row, Transaction};
 use uuid::Uuid;
 
 use crate::error::StorageError;
 use crate::model::{
-    AuditContext, AuditStatus, FailureSeverity, NewAuditEvent, NewFailureEvent,
-    NewSinkDeliveryOutcome, ProjectConfigWriteResult, RetentionConfig, SinkDeliveryStatus,
+    AuditContext, AuditEventRecord, AuditStatus, FailureEventRecord, FailureListQuery,
+    FailureSeverity, NewAuditEvent, NewFailureEvent, NewSinkDeliveryOutcome, OperationalListQuery,
+    ProjectConfigWriteResult, RetentionConfig, SinkDeliveryOutcomeRecord, SinkDeliveryStatus,
 };
 use crate::project_config_codec::{ProjectConfigCodec, StoredProjectConfig};
 use crate::secret::SecretCipher;
@@ -335,6 +336,7 @@ impl PostgresStorage {
 
     pub async fn resolve_failure(
         &self,
+        project_id: &ProjectId,
         failure_id: &str,
         resolution: &str,
         audit: AuditContext,
@@ -346,19 +348,22 @@ impl PostgresStorage {
         let row = sqlx::query(
             r#"
             UPDATE failure_events
-            SET resolved_at = now(), resolution = $2
-            WHERE failure_id = $1 AND resolved_at IS NULL
+            SET resolved_at = now(), resolution = $3
+            WHERE failure_id = $1
+              AND project_id = $2
+              AND resolved_at IS NULL
             RETURNING project_id
             "#,
         )
         .bind(failure_id)
+        .bind(project_id.as_str())
         .bind(resolution)
         .fetch_optional(&mut *tx)
         .await?;
 
         let Some(row) = row else {
             return Err(StorageError::InvalidStoredState {
-                reason: "failure was not found or already resolved",
+                reason: "failure was not found for project or already resolved",
             });
         };
 
@@ -380,6 +385,90 @@ impl PostgresStorage {
 
         tx.commit().await?;
         Ok(())
+    }
+
+    pub async fn list_audit_events(
+        &self,
+        project_id: &ProjectId,
+        query: OperationalListQuery,
+    ) -> Result<Vec<AuditEventRecord>, StorageError> {
+        let query = query.sanitized();
+        let rows = sqlx::query(
+            r#"
+            SELECT audit_event_id, project_id, actor_id, action, target_type,
+                   target_id, status, reason, metadata, occurred_at
+            FROM audit_events
+            WHERE project_id = $1
+              AND ($2::timestamptz IS NULL OR occurred_at < $2)
+            ORDER BY occurred_at DESC
+            LIMIT $3
+            "#,
+        )
+        .bind(project_id.as_str())
+        .bind(query.before)
+        .bind(i64::from(query.limit))
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(audit_event_from_row).collect()
+    }
+
+    pub async fn list_failures(
+        &self,
+        project_id: &ProjectId,
+        query: FailureListQuery,
+    ) -> Result<Vec<FailureEventRecord>, StorageError> {
+        let query = query.sanitized();
+        let rows = sqlx::query(
+            r#"
+            SELECT failure_id, project_id, event_id, sink_id, component,
+                   failure_kind, severity, message, details, occurred_at,
+                   resolved_at, resolution
+            FROM failure_events
+            WHERE project_id = $1
+              AND ($2::timestamptz IS NULL OR occurred_at < $2)
+              AND ($3::bool = false OR resolved_at IS NULL)
+            ORDER BY occurred_at DESC
+            LIMIT $4
+            "#,
+        )
+        .bind(project_id.as_str())
+        .bind(query.before)
+        .bind(query.unresolved_only)
+        .bind(i64::from(query.limit))
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter().map(failure_event_from_row).collect()
+    }
+
+    pub async fn list_delivery_outcomes(
+        &self,
+        project_id: &ProjectId,
+        query: OperationalListQuery,
+    ) -> Result<Vec<SinkDeliveryOutcomeRecord>, StorageError> {
+        let query = query.sanitized();
+        let rows = sqlx::query(
+            r#"
+            SELECT delivery_id, project_id, event_id, sink_id, status,
+                   http_status, response_body_bytes, failure_reason,
+                   correlation_id, duration_ms, attempt, occurred_at
+            FROM sink_delivery_outcomes
+            WHERE project_id = $1
+              AND ($2::timestamptz IS NULL OR occurred_at < $2)
+            ORDER BY occurred_at DESC
+            LIMIT $3
+            "#,
+        )
+        .bind(project_id.as_str())
+        .bind(query.before)
+        .bind(i64::from(query.limit))
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter()
+            .map(sink_delivery_outcome_from_row)
+            .collect()
     }
 
     pub async fn delete_expired_operational_rows(
@@ -593,6 +682,131 @@ async fn current_project_version_tx(
 
     row.map(|row| i64_to_u64("version", row.try_get::<i64, _>("version")?))
         .transpose()
+}
+
+fn audit_event_from_row(row: PgRow) -> Result<AuditEventRecord, StorageError> {
+    let project_id = row
+        .try_get::<Option<String>, _>("project_id")?
+        .map(ProjectId::new)
+        .transpose()?;
+    let actor_id = row
+        .try_get::<Option<String>, _>("actor_id")?
+        .map(UserId::new)
+        .transpose()?;
+    let metadata: serde_json::Value = row.try_get("metadata")?;
+
+    Ok(AuditEventRecord {
+        audit_event_id: row.try_get("audit_event_id")?,
+        project_id,
+        actor_id,
+        action: row.try_get("action")?,
+        target_type: row.try_get("target_type")?,
+        target_id: row.try_get("target_id")?,
+        status: parse_audit_status(&row.try_get::<String, _>("status")?)?,
+        reason: row.try_get("reason")?,
+        metadata: value_to_object("metadata", metadata)?,
+        occurred_at: row.try_get("occurred_at")?,
+    })
+}
+
+fn failure_event_from_row(row: PgRow) -> Result<FailureEventRecord, StorageError> {
+    let project_id = ProjectId::new(row.try_get::<String, _>("project_id")?)?;
+    let event_id = row
+        .try_get::<Option<String>, _>("event_id")?
+        .map(EventId::new)
+        .transpose()?;
+    let sink_id = row
+        .try_get::<Option<String>, _>("sink_id")?
+        .map(SinkId::new)
+        .transpose()?;
+    let details: serde_json::Value = row.try_get("details")?;
+
+    Ok(FailureEventRecord {
+        failure_id: row.try_get("failure_id")?,
+        project_id,
+        event_id,
+        sink_id,
+        component: row.try_get("component")?,
+        failure_kind: row.try_get("failure_kind")?,
+        severity: parse_failure_severity(&row.try_get::<String, _>("severity")?)?,
+        message: row.try_get("message")?,
+        details: value_to_object("details", details)?,
+        occurred_at: row.try_get("occurred_at")?,
+        resolved_at: row.try_get("resolved_at")?,
+        resolution: row.try_get("resolution")?,
+    })
+}
+
+fn sink_delivery_outcome_from_row(row: PgRow) -> Result<SinkDeliveryOutcomeRecord, StorageError> {
+    Ok(SinkDeliveryOutcomeRecord {
+        delivery_id: row.try_get("delivery_id")?,
+        project_id: ProjectId::new(row.try_get::<String, _>("project_id")?)?,
+        event_id: EventId::new(row.try_get::<String, _>("event_id")?)?,
+        sink_id: SinkId::new(row.try_get::<String, _>("sink_id")?)?,
+        status: row.try_get("status")?,
+        http_status: optional_i32_to_u16("http_status", row.try_get("http_status")?)?,
+        response_body_bytes: optional_i64_to_u64(
+            "response_body_bytes",
+            row.try_get("response_body_bytes")?,
+        )?,
+        failure_reason: row.try_get("failure_reason")?,
+        correlation_id: row.try_get("correlation_id")?,
+        duration_ms: optional_i64_to_u64("duration_ms", row.try_get("duration_ms")?)?,
+        attempt: i32_to_u16("attempt", row.try_get("attempt")?)?,
+        occurred_at: row.try_get("occurred_at")?,
+    })
+}
+
+fn parse_audit_status(value: &str) -> Result<AuditStatus, StorageError> {
+    match value {
+        "succeeded" => Ok(AuditStatus::Succeeded),
+        "failed" => Ok(AuditStatus::Failed),
+        _ => Err(StorageError::InvalidStoredState {
+            reason: "unknown audit status",
+        }),
+    }
+}
+
+fn parse_failure_severity(value: &str) -> Result<FailureSeverity, StorageError> {
+    match value {
+        "warning" => Ok(FailureSeverity::Warning),
+        "error" => Ok(FailureSeverity::Error),
+        "critical" => Ok(FailureSeverity::Critical),
+        _ => Err(StorageError::InvalidStoredState {
+            reason: "unknown failure severity",
+        }),
+    }
+}
+
+fn value_to_object(
+    field: &'static str,
+    value: serde_json::Value,
+) -> Result<serde_json::Map<String, serde_json::Value>, StorageError> {
+    match value {
+        serde_json::Value::Object(object) => Ok(object),
+        _ => Err(StorageError::InvalidField {
+            field,
+            reason: "stored JSON value must be an object",
+        }),
+    }
+}
+
+fn optional_i64_to_u64(
+    field: &'static str,
+    value: Option<i64>,
+) -> Result<Option<u64>, StorageError> {
+    value.map(|value| i64_to_u64(field, value)).transpose()
+}
+
+fn optional_i32_to_u16(
+    field: &'static str,
+    value: Option<i32>,
+) -> Result<Option<u16>, StorageError> {
+    value.map(|value| i32_to_u16(field, value)).transpose()
+}
+
+fn i32_to_u16(field: &'static str, value: i32) -> Result<u16, StorageError> {
+    u16::try_from(value).map_err(|_| StorageError::NumericOverflow { field })
 }
 
 fn validate_config(config: &PostgresStorageConfig) -> Result<(), StorageError> {

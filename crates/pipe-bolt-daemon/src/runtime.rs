@@ -279,6 +279,10 @@ pub struct ProjectRuntime {
 }
 
 impl ProjectRuntime {
+    pub fn validate_config(config: &ProjectConfig) -> Result<(), RuntimeError> {
+        validate_runtime_config(config)
+    }
+
     pub async fn start(
         config: ProjectConfig,
         settings: RuntimeSettings,

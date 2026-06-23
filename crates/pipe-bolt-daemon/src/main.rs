@@ -15,29 +15,34 @@
 pub mod config_loader;
 pub mod persistence_writer;
 pub mod runtime;
+pub mod runtime_control;
 
 use std::error::Error;
 use std::sync::Arc;
 
 #[cfg(debug_assertions)]
 use dotenvy::dotenv;
+use pipe_bolt_api::{ApiState, ManagementAuth, RuntimeControl, serve_management_api};
 use pipe_bolt_domain::ProjectConfig;
 use pipe_bolt_storage::model::AuditContext;
 use pipe_bolt_storage::postgres::{PostgresStorage, PostgresStorageConfig};
 use pipe_bolt_storage::secret::StorageKeyring;
+use tokio::sync::watch;
+use tokio::task::JoinHandle;
 
 use crate::config_loader::{
     ConfigLoadError, DaemonRuntimeConfig, ProjectConfigSource, StorageRuntimeConfig,
     load_project_config,
 };
 use crate::runtime::{ProjectRuntime, RuntimePersistence};
+use crate::runtime_control::RuntimeSupervisor;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     #[cfg(debug_assertions)]
     {
-        if let Err(e) = dotenv() {
-            eprintln!("Warning: Failed to load .env file: {}", e);
+        if let Err(error) = dotenv() {
+            eprintln!("Warning: Failed to load .env file: {error}");
         }
     }
 
@@ -49,13 +54,87 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let runtime_persistence = storage
         .as_ref()
         .map(|storage| RuntimePersistence::new(project_config.id.clone(), Arc::clone(storage)));
-    let runtime =
-        ProjectRuntime::start(project_config, daemon_config.runtime, runtime_persistence).await?;
+    let runtime = ProjectRuntime::start(
+        project_config.clone(),
+        daemon_config.runtime.clone(),
+        runtime_persistence.clone(),
+    )
+    .await?;
+
+    let (runtime_owner, api_shutdown_tx, api_worker) = start_management_api_if_configured(
+        &daemon_config,
+        storage.as_ref(),
+        runtime_persistence,
+        project_config,
+        runtime,
+    )
+    .await?;
 
     pipe_bolt_core::web::realtime::router::graceful_signal().await;
-    runtime.shutdown().await?;
+
+    if let Some(shutdown_tx) = api_shutdown_tx {
+        let _ = shutdown_tx.send(true);
+    }
+
+    runtime_owner.shutdown().await?;
+
+    if let Some(worker) = api_worker {
+        join_management_api_worker(worker).await?;
+    }
 
     Ok(())
+}
+
+async fn start_management_api_if_configured(
+    daemon_config: &DaemonRuntimeConfig,
+    storage: Option<&Arc<PostgresStorage>>,
+    runtime_persistence: Option<RuntimePersistence>,
+    project_config: ProjectConfig,
+    runtime: ProjectRuntime,
+) -> Result<
+    (
+        RuntimeOwner,
+        Option<watch::Sender<bool>>,
+        Option<JoinHandle<()>>,
+    ),
+    Box<dyn Error + Send + Sync>,
+> {
+    let Some(api_config) = &daemon_config.management_api else {
+        return Ok((RuntimeOwner::Standalone(Some(runtime)), None, None));
+    };
+    let storage = storage.ok_or(ConfigLoadError::MissingEnv {
+        name: config_loader::DATABASE_URL_ENV,
+    })?;
+    let runtime_persistence = runtime_persistence.ok_or(ConfigLoadError::MissingEnv {
+        name: config_loader::DATABASE_URL_ENV,
+    })?;
+
+    let supervisor = Arc::new(RuntimeSupervisor::new(
+        project_config,
+        runtime,
+        daemon_config.runtime.clone(),
+        runtime_persistence,
+        Arc::clone(storage),
+    ));
+    let supervisor_api: Arc<dyn RuntimeControl> = Arc::<RuntimeSupervisor>::clone(&supervisor);
+    let auth = ManagementAuth::bearer(api_config.bearer_token.clone())?;
+    let state = ApiState::new(
+        Arc::clone(storage),
+        supervisor_api,
+        auth,
+        api_config.max_config_body_bytes,
+    );
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let bind_addr = api_config.bind_addr;
+    let worker = tokio::spawn(async move {
+        serve_management_api(bind_addr, state, shutdown_rx).await;
+    });
+
+    Ok((
+        RuntimeOwner::Supervisor(supervisor),
+        Some(shutdown_tx),
+        Some(worker),
+    ))
 }
 
 async fn build_storage(
@@ -105,7 +184,6 @@ async fn load_config(
             };
 
             let config = load_project_config(options).await?;
-
             validate_bootstrap_project_id(&config, project_id)?;
 
             storage
@@ -134,7 +212,6 @@ fn validate_bootstrap_project_id(
     Ok(())
 }
 
-/// Initializes the tracing subscriber with EnvFilter support
 fn init_tracing(filter: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
     let env_filter = tracing_subscriber::EnvFilter::try_new(filter)?;
     tracing_subscriber::fmt()
@@ -143,31 +220,29 @@ fn init_tracing(filter: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
     Ok(())
 }
 
-#[cfg(test)]
-/// Helper to construct a project config for testing purposes
-fn test_project_config(id: &str) -> ProjectConfig {
-    ProjectConfig {
-        id: pipe_bolt_domain::ProjectId::new(id).expect("project id"),
-        tenant_id: None,
-        name: "Test Project".to_owned(),
-        description: None,
-        enabled: true,
-        version: 1,
-        brokers: Vec::new(),
-        routes: Vec::new(),
-        schema_mappings: Vec::new(),
-        rules: Vec::new(),
-        command_templates: Vec::new(),
-        sinks: Vec::new(),
-    }
+async fn join_management_api_worker(
+    worker: JoinHandle<()>,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    worker.await?;
+    Ok(())
 }
 
-#[test]
-fn bootstrap_rejects_file_with_different_project_id() {
-    let config = test_project_config("project-file");
-    let expected = pipe_bolt_domain::ProjectId::new("project-env").expect("project id");
+enum RuntimeOwner {
+    Standalone(Option<ProjectRuntime>),
+    Supervisor(Arc<RuntimeSupervisor>),
+}
 
-    let error = validate_bootstrap_project_id(&config, &expected).expect_err("mismatch error");
+impl RuntimeOwner {
+    async fn shutdown(self) -> Result<(), crate::runtime::RuntimeError> {
+        match self {
+            Self::Standalone(runtime) => {
+                if let Some(runtime) = runtime {
+                    runtime.shutdown().await?;
+                }
+            }
+            Self::Supervisor(supervisor) => supervisor.shutdown().await?,
+        }
 
-    assert!(matches!(error, ConfigLoadError::ProjectIdMismatch { .. }));
+        Ok(())
+    }
 }

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = [
+members = ["crates/pipe-bolt-api",
     "crates/pipe-bolt-core",
     "crates/pipe-bolt-daemon",
     "crates/pipe-bolt-domain",
