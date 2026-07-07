@@ -20,9 +20,7 @@ pub mod runtime_control;
 use std::error::Error;
 use std::sync::Arc;
 
-#[cfg(debug_assertions)]
-use dotenvy::dotenv;
-use pipe_bolt_api::{ApiState, ManagementAuth, RuntimeControl, serve_management_api};
+use pipe_bolt_api::{ApiState, ManagementAuth, ManagementStorage, serve_management_api};
 use pipe_bolt_domain::ProjectConfig;
 use pipe_bolt_storage::model::AuditContext;
 use pipe_bolt_storage::postgres::{PostgresStorage, PostgresStorageConfig};
@@ -39,9 +37,9 @@ use crate::runtime_control::RuntimeSupervisor;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
-    #[cfg(debug_assertions)]
+    #[cfg(feature = "dotenvy")]
     {
-        if let Err(error) = dotenv() {
+        if let Err(error) = dotenvy::dotenv() {
             eprintln!("Warning: Failed to load .env file: {error}");
         }
     }
@@ -116,11 +114,15 @@ async fn start_management_api_if_configured(
         runtime_persistence,
         Arc::clone(storage),
     ));
-    let supervisor_api: Arc<dyn RuntimeControl> = Arc::<RuntimeSupervisor>::clone(&supervisor);
+
     let auth = ManagementAuth::bearer(api_config.bearer_token.clone())?;
+    let api_storage: Arc<dyn ManagementStorage> = Arc::<PostgresStorage>::clone(storage);
+    let api_runtime: Arc<dyn pipe_bolt_api::RuntimeControl> =
+        Arc::<RuntimeSupervisor>::clone(&supervisor);
+
     let state = ApiState::new(
-        Arc::clone(storage),
-        supervisor_api,
+        api_storage,
+        api_runtime,
         auth,
         api_config.max_config_body_bytes,
     );

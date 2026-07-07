@@ -4,9 +4,9 @@ use salvo::prelude::*;
 use tokio::sync::watch;
 
 use crate::handler::{
-    get_audit_events, get_delivery_outcomes, get_failures, get_health, get_project_config,
-    get_runtime_status, post_runtime_reload, put_project_config, resolve_failure,
+    get_audit_events, get_delivery_outcomes, get_failures, get_health, get_project_config, get_runtime_status, post_runtime_reload, put_project_config, require_management_auth, resolve_failure,
 };
+use crate::openapi::attach_openapi;
 use crate::state::ApiState;
 
 pub async fn serve_management_api(
@@ -29,11 +29,13 @@ pub async fn serve_management_api(
 }
 
 pub fn management_router(state: ApiState) -> Router {
-    Router::new()
+    let router = Router::new()
         .hoop(affix_state::inject(state))
         .push(Router::with_path("health").get(get_health))
+        .push(Router::with_path("healthz").get(get_health))
         .push(
             Router::with_path("projects/{project_id}")
+                .hoop(require_management_auth)
                 .push(
                     Router::with_path("config")
                         .get(get_project_config)
@@ -48,5 +50,11 @@ pub fn management_router(state: ApiState) -> Router {
                         .push(Router::with_path("status").get(get_runtime_status))
                         .push(Router::with_path("reload").post(post_runtime_reload)),
                 ),
-        )
+        );
+
+    if cfg!(debug_assertions) {
+        attach_openapi(router)
+    } else {
+        router
+    }
 }

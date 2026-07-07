@@ -1,0 +1,17 @@
+type: workspace
+model: workspace
+id: wk_RswPFWqsc9
+createdAt: 2026-06-24T18:28:13.519748300
+updatedAt: 2026-06-24T19:24:04.227990200
+authentication: {}
+authenticationType: null
+description: ''
+headers: []
+name: pipe-bolt
+encryptionKeyChallenge: null
+settingValidateCertificates: true
+settingFollowRedirects: true
+settingRequestTimeout: 0
+settingDnsOverrides: []
+settingSendCookies: true
+settingStoreCookies: true

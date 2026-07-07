@@ -362,9 +362,28 @@ impl PostgresStorage {
         .await?;
 
         let Some(row) = row else {
-            return Err(StorageError::InvalidStoredState {
-                reason: "failure was not found for project or already resolved",
-            });
+            let existing = sqlx::query(
+                r#"
+                SELECT resolved_at
+                FROM failure_events
+                WHERE failure_id = $1 AND project_id = $2
+                "#,
+            )
+            .bind(failure_id)
+            .bind(project_id.as_str())
+            .fetch_optional(&mut *tx)
+            .await?;
+
+            return match existing {
+                None => Err(StorageError::FailureNotFound {
+                    project_id: project_id.to_string(),
+                    failure_id: failure_id.to_owned(),
+                }),
+                Some(_) => Err(StorageError::FailureAlreadyResolved {
+                    project_id: project_id.to_string(),
+                    failure_id: failure_id.to_owned(),
+                }),
+            };
         };
 
         let project_id = ProjectId::new(row.try_get::<String, _>("project_id")?)?;

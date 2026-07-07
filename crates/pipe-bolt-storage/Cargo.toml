@@ -10,13 +10,13 @@ path = "src/lib.rs"
 [dependencies]
 pipe-bolt-domain = { path = "../pipe-bolt-domain" }
 
-aes-gcm = "0.10.3"
-base64 = "0.22.1"
-rand = "0.10.1"
-serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.150"
-sha2 = "0.11.0"
-sqlx = { git = "https://github.com/transact-rs/sqlx", rev = "a4aeeb40153eb873a74d0ff82e2bb5f6be925f12", default-features = false, features = [
+aes-gcm = { workspace = true }
+base64 = { workspace = true }
+rand = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+sqlx = { workspace = true, default-features = false, features = [
     "runtime-tokio",
     "tls-rustls",
     "postgres",
@@ -26,7 +26,7 @@ sqlx = { git = "https://github.com/transact-rs/sqlx", rev = "a4aeeb40153eb873a74
     "migrate",
     "macros"
 ] }
-thiserror = "2.0.18"
-time = { version = "0.3.49", features = ["serde", "serde-well-known"] }
-uuid = { version = "1.23.3", features = ["v7", "serde"] }
-tokio = "1.52.3"
+thiserror = { workspace = true }
+time = { workspace = true, features = ["serde", "serde-well-known"] }
+uuid = { workspace = true, features = ["v7", "serde"] }
+tokio = { workspace = true, features = ["macros"] }

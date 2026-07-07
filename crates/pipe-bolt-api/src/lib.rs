@@ -14,11 +14,14 @@ pub mod dto;
 pub mod error;
 pub mod handler;
 pub mod model;
+pub mod openapi;
 pub mod router;
 pub mod runtime_control;
 pub mod state;
+pub mod storage;
 
 pub use error::ApiError;
 pub use router::{management_router, serve_management_api};
 pub use runtime_control::{RuntimeControl, RuntimeControlError};
 pub use state::{ApiState, ManagementAuth};
+pub use storage::ManagementStorage;

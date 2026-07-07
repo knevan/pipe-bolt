@@ -1,22 +1,84 @@
-﻿use pipe_bolt_domain::{ProjectConfig, ProjectId};
+﻿use pipe_bolt_domain::{
+    BrokerConnectionConfig, CommandTemplate, PayloadSchemaMapping, ProjectConfig, ProjectId,
+    RuleDefinition, SinkDefinition, TenantId, TopicRouteConfig,
+};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
-#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
-pub struct HealthResponse {
-    pub status: &'static str,
-    pub service: &'static str,
+pub const PROJECT_CONFIG_DOCUMENT_SCHEMA_VERSION: u16 = 1;
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ProjectConfigDocumentV1 {
+    pub project_id: ProjectId,
+    pub tenant_id: Option<TenantId>,
+    pub name: String,
+    pub description: Option<String>,
+    pub enabled: bool,
+    pub brokers: Vec<BrokerConnectionConfig>,
+    pub routes: Vec<TopicRouteConfig>,
+    pub schema_mappings: Vec<PayloadSchemaMapping>,
+    pub rules: Vec<RuleDefinition>,
+    pub command_templates: Vec<CommandTemplate>,
+    pub sinks: Vec<SinkDefinition>,
+}
+
+impl ProjectConfigDocumentV1 {
+    pub fn from_domain(config: ProjectConfig) -> Self {
+        Self {
+            project_id: config.id,
+            tenant_id: config.tenant_id,
+            name: config.name,
+            description: config.description,
+            enabled: config.enabled,
+            brokers: config.brokers,
+            routes: config.routes,
+            schema_mappings: config.schema_mappings,
+            rules: config.rules,
+            command_templates: config.command_templates,
+            sinks: config.sinks,
+        }
+    }
+
+    pub fn into_domain(self, version: u64) -> ProjectConfig {
+        ProjectConfig {
+            id: self.project_id,
+            tenant_id: self.tenant_id,
+            name: self.name,
+            description: self.description,
+            enabled: self.enabled,
+            version,
+            brokers: self.brokers,
+            routes: self.routes,
+            schema_mappings: self.schema_mappings,
+            rules: self.rules,
+            command_templates: self.command_templates,
+            sinks: self.sinks,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ProjectConfigResponse {
-    pub config: ProjectConfig,
+    pub schema_version: u16,
+    pub version: u64,
+    pub config: ProjectConfigDocumentV1,
+}
+
+impl ProjectConfigResponse {
+    pub fn from_domain(config: ProjectConfig) -> Self {
+        let version = config.version;
+        Self {
+            schema_version: PROJECT_CONFIG_DOCUMENT_SCHEMA_VERSION,
+            version,
+            config: ProjectConfigDocumentV1::from_domain(config),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct UpdateProjectConfigRequest {
     pub expected_version: u64,
-    pub config: ProjectConfig,
+    pub config: ProjectConfigDocumentV1,
     pub reason: Option<String>,
 }
 
@@ -41,7 +103,7 @@ pub struct ResolveFailureResponse {
     pub resolved: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Default)]
 pub struct RuntimeReloadRequest {
     pub reason: Option<String>,
 }
@@ -53,11 +115,18 @@ pub struct ListResponse<T> {
     pub next_before: Option<OffsetDateTime>,
 }
 
+#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
+pub struct HealthResponse {
+    pub status: &'static str,
+    pub service: &'static str,
+}
+
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RuntimeLifecycleState {
     Running,
     Reloading,
+    Stopping,
     Stopped,
 }
 
@@ -72,6 +141,17 @@ pub struct RuntimeStatusResponse {
     pub last_reload_at: Option<OffsetDateTime>,
     pub last_reload_error: Option<String>,
     pub counters: RuntimeCountersResponse,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
+pub struct RuntimeReloadResponse {
+    pub project_id: ProjectId,
+    pub previous_version: u64,
+    pub active_version: u64,
+    #[serde(with = "time::serde::rfc3339")]
+    pub reloaded_at: OffsetDateTime,
+    pub old_runtime_shutdown_error: Option<String>,
+    pub audit_event_id: String,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Default)]
@@ -113,16 +193,6 @@ pub struct PersistenceWriterCountersResponse {
     pub write_succeeded_total: u64,
     pub write_failed_total: u64,
     pub write_timeout_total: u64,
-}
-
-#[derive(Debug, Clone, Eq, PartialEq, Serialize)]
-pub struct RuntimeReloadResponse {
-    pub project_id: ProjectId,
-    pub previous_version: u64,
-    pub active_version: u64,
-    #[serde(with = "time::serde::rfc3339")]
-    pub reloaded_at: OffsetDateTime,
-    pub old_runtime_shutdown_error: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]

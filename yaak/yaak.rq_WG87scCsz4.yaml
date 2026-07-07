@@ -1,0 +1,42 @@
+type: http_request
+model: http_request
+id: rq_WG87scCsz4
+createdAt: 2026-06-24T18:34:34.727763
+updatedAt: 2026-06-24T19:25:40.580400400
+workspaceId: wk_RswPFWqsc9
+folderId: fl_38jkvEMWeo
+authentication: {}
+authenticationType: null
+body: {}
+bodyType: null
+description: |-
+  Check the API health status (no authentication token required)
+
+  Method: GET
+  URL: http://127.0.0.1:8081/health
+  Headers: -
+headers:
+- enabled: true
+  name: ''
+  value: ''
+  id: RRUaE89gwE
+method: GET
+name: Health Check
+sortPriority: 0.0
+url: http://127.0.0.1:8081/health
+urlParameters: []
+settingSendCookies:
+  enabled: false
+  value: true
+settingStoreCookies:
+  enabled: false
+  value: true
+settingValidateCertificates:
+  enabled: false
+  value: true
+settingFollowRedirects:
+  enabled: false
+  value: true
+settingRequestTimeout:
+  enabled: false
+  value: 0

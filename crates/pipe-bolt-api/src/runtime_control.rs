@@ -1,4 +1,5 @@
-﻿use pipe_bolt_domain::ProjectId;
+﻿use pipe_bolt_domain::{ProjectConfig, ProjectId};
+use pipe_bolt_storage::AuditContext;
 use salvo::async_trait;
 use thiserror::Error;
 
@@ -11,10 +12,16 @@ pub trait RuntimeControl: Send + Sync + 'static {
         project_id: &ProjectId,
     ) -> Result<RuntimeStatusResponse, RuntimeControlError>;
 
+    async fn validate_candidate_config(
+        &self,
+        project_id: &ProjectId,
+        config: &ProjectConfig,
+    ) -> Result<(), RuntimeControlError>;
+
     async fn reload(
         &self,
         project_id: &ProjectId,
-        reason: Option<String>,
+        audit: AuditContext,
     ) -> Result<RuntimeReloadResponse, RuntimeControlError>;
 }
 
@@ -23,14 +30,20 @@ pub enum RuntimeControlError {
     #[error("project '{project_id}' is not managed by this runtime")]
     ProjectNotManaged { project_id: String },
 
-    #[error("runtime reload is already in progress")]
+    #[error("runtime lifecycle operation is already in progress")]
     ReloadInProgress,
+
+    #[error("runtime is shutting down: {reason}")]
+    ShuttingDown { reason: String },
 
     #[error("runtime unavailable: {reason}")]
     RuntimeUnavailable { reason: String },
 
     #[error("runtime config invalid: {reason}")]
     InvalidConfig { reason: String },
+
+    #[error("old runtime shutdown was not proven safe: {reason}")]
+    UnsafeOldRuntimeShutdown { reason: String },
 
     #[error("runtime start failed: {reason}")]
     StartFailed { reason: String },

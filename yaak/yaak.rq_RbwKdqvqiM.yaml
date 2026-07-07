@@ -1,0 +1,109 @@
+type: http_request
+model: http_request
+id: rq_RbwKdqvqiM
+createdAt: 2026-06-24T18:41:05.190458600
+updatedAt: 2026-06-24T19:37:43.274577700
+workspaceId: wk_RswPFWqsc9
+folderId: fl_38jkvEMWeo
+authentication: {}
+authenticationType: null
+body:
+  text: |
+    {
+      "expected_version": 2,
+      "reason": "Updating local configuration for test",
+      "config": {
+        "id": "project-dev-1",
+        "name": "Local Development Project",
+        "description": "Project configuration for local development",
+        "enabled": true,
+        "version": 1,
+        "brokers": [
+          {
+            "id": "broker-local",
+            "name": "Local MQTT Broker",
+            "host": "localhost",
+            "port": 1883,
+            "tls": "disabled",
+            "keep_alive": 30,
+            "clean_session": true,
+            "client_id": "pipe-bolt-local-client",
+            "reconnect": {
+              "min_delay": 500,
+              "max_delay": 30000
+            },
+            "enabled": true
+          }
+        ],
+        "routes": [
+          {
+            "id": "route-local-telemetry",
+            "broker_id": "broker-local",
+            "name": "Local Telemetry Route",
+            "topic_filter": "device/+/telemetry",
+            "codec": "json",
+            "schema_mapping_id": null,
+            "device_id": {
+              "type": "topic_wildcard_index",
+              "index": 1
+            },
+            "event_type": "telemetry",
+            "qos": "at_most_once",
+            "enabled": true,
+            "backpressure": "reject"
+          }
+        ],
+        "schema_mappings": [],
+        "rules": [],
+        "command_templates": [],
+        "sinks": []
+      }
+    }
+bodyType: application/json
+description: |-
+  1. In the GET project config response, the current configuration version stored in the database is 2 (“version”: 2).
+  2. However, the PUT project config request you sent includes “expected_version”: 1.
+  3. The server compares these values:
+     - expected_version (from the request): 1
+     - actual_version (in the database): 2
+     - Since the values do not match (1 != 2), the server cancels the update to prevent accidental overwriting of the newer data, and returns a conflict error.
+
+  Solution:
+  - Change the “expected_version” value in the body of your PUT request so that it matches the current version in the database, which is 2
+headers:
+- enabled: true
+  name: Authorization
+  value: Bearer dev_secret_management_token_2026
+  id: pgp4zUjGff
+- enabled: true
+  name: x-pipe-bolt-actor-id
+  value: user-dev-1
+  id: PwxskzuzkS
+- enabled: true
+  name: ''
+  value: ''
+  id: IpFzw5BKF2
+- enabled: true
+  name: Content-Type
+  value: application/json
+  id: NjM6eW4yGZ
+method: PUT
+name: Project Config
+sortPriority: 2000.0
+url: http://127.0.0.1:8081/projects/project-dev-1/config
+urlParameters: []
+settingSendCookies:
+  enabled: false
+  value: true
+settingStoreCookies:
+  enabled: false
+  value: true
+settingValidateCertificates:
+  enabled: false
+  value: true
+settingFollowRedirects:
+  enabled: false
+  value: true
+settingRequestTimeout:
+  enabled: false
+  value: 0

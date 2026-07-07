@@ -8,7 +8,9 @@ use pipe_bolt_api::dto::{
 };
 use pipe_bolt_api::{RuntimeControl, RuntimeControlError};
 use pipe_bolt_domain::{ProjectConfig, ProjectId};
+use pipe_bolt_storage::model::{AuditContext, AuditStatus, NewAuditEvent};
 use pipe_bolt_storage::postgres::PostgresStorage;
+use serde_json::json;
 use time::OffsetDateTime;
 use tokio::sync::Mutex;
 
@@ -20,7 +22,7 @@ pub struct RuntimeSupervisor {
     runtime_settings: RuntimeSettings,
     persistence: RuntimePersistence,
     state: Mutex<RuntimeState>,
-    reload_lock: Mutex<()>,
+    lifecycle_lock: Mutex<()>,
 }
 
 impl RuntimeSupervisor {
@@ -38,6 +40,7 @@ impl RuntimeSupervisor {
             persistence,
             state: Mutex::new(RuntimeState {
                 phase: RuntimeLifecycleState::Running,
+                stopping: false,
                 slot: Some(RuntimeSlot {
                     config: initial_config,
                     runtime,
@@ -46,22 +49,31 @@ impl RuntimeSupervisor {
                 last_reload_at: None,
                 last_reload_error: None,
             }),
-            reload_lock: Mutex::new(()),
+            lifecycle_lock: Mutex::new(()),
         }
     }
 
     pub async fn shutdown(&self) -> Result<(), crate::runtime::RuntimeError> {
+        let _lifecycle_guard = self.lifecycle_lock.lock().await;
         let slot = {
             let mut state = self.state.lock().await;
-            state.phase = RuntimeLifecycleState::Stopped;
+            state.stopping = true;
+            state.phase = RuntimeLifecycleState::Stopping;
             state.slot.take()
         };
 
-        if let Some(slot) = slot {
-            slot.runtime.shutdown().await?;
+        let result = match slot {
+            Some(slot) => slot.runtime.shutdown().await,
+            None => Ok(()),
+        };
+
+        let mut state = self.state.lock().await;
+        state.phase = RuntimeLifecycleState::Stopped;
+        if let Err(error) = &result {
+            state.last_reload_error = Some(format!("shutdown failed: {error}"));
         }
 
-        Ok(())
+        result
     }
 
     fn ensure_project(&self, project_id: &ProjectId) -> Result<(), RuntimeControlError> {
@@ -72,6 +84,66 @@ impl RuntimeSupervisor {
         }
 
         Ok(())
+    }
+
+    async fn ensure_not_stopping(&self) -> Result<(), RuntimeControlError> {
+        let state = self.state.lock().await;
+        if state.stopping {
+            return Err(RuntimeControlError::ShuttingDown {
+                reason: "daemon shutdown has started".to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn record_reload_audit(
+        &self,
+        audit: AuditContext,
+        status: AuditStatus,
+        previous_version: Option<u64>,
+        candidate_version: Option<u64>,
+        active_version_after: Option<u64>,
+        old_shutdown_error: Option<&str>,
+        reload_error: Option<&str>,
+    ) -> Result<String, RuntimeControlError> {
+        let mut metadata = serde_json::Map::new();
+        metadata.insert("previous_version".to_owned(), json!(previous_version));
+        metadata.insert("candidate_version".to_owned(), json!(candidate_version));
+        metadata.insert(
+            "active_version_after".to_owned(),
+            json!(active_version_after),
+        );
+        if let Some(error) = old_shutdown_error {
+            metadata.insert("old_shutdown_error".to_owned(), json!(error));
+        }
+        if let Some(error) = reload_error {
+            metadata.insert("reload_error".to_owned(), json!(error));
+        }
+
+        self.storage
+            .record_audit_event(NewAuditEvent {
+                project_id: Some(self.project_id.clone()),
+                actor_id: audit.actor_id,
+                action: "runtime.reload".to_owned(),
+                target_type: "runtime".to_owned(),
+                target_id: self.project_id.to_string(),
+                status,
+                reason: audit.reason,
+                metadata,
+            })
+            .await
+            .map_err(|error| RuntimeControlError::Storage {
+                reason: error.to_string(),
+            })
+    }
+
+    async fn set_reload_failed(&self, message: String) {
+        let mut state = self.state.lock().await;
+        state.phase = RuntimeLifecycleState::Stopped;
+        state.slot = None;
+        state.last_reload_at = Some(OffsetDateTime::now_utc());
+        state.last_reload_error = Some(message);
     }
 }
 
@@ -87,18 +159,43 @@ impl RuntimeControl for RuntimeSupervisor {
         Ok(status_from_state(&self.project_id, &state))
     }
 
+    async fn validate_candidate_config(
+        &self,
+        project_id: &ProjectId,
+        config: &ProjectConfig,
+    ) -> Result<(), RuntimeControlError> {
+        self.ensure_project(project_id)?;
+        self.ensure_not_stopping().await?;
+
+        if config.id != *project_id {
+            return Err(RuntimeControlError::InvalidConfig {
+                reason: format!(
+                    "candidate config project_id '{}' does not match managed project_id '{project_id}'",
+                    config.id
+                ),
+            });
+        }
+
+        ProjectRuntime::validate_config(config).map_err(|error| {
+            RuntimeControlError::InvalidConfig {
+                reason: error.to_string(),
+            }
+        })
+    }
+
     async fn reload(
         &self,
         project_id: &ProjectId,
-        reason: Option<String>,
+        audit: AuditContext,
     ) -> Result<RuntimeReloadResponse, RuntimeControlError> {
         self.ensure_project(project_id)?;
-
-        let reload_guard = self
-            .reload_lock
+        let lifecycle_guard = self
+            .lifecycle_lock
             .try_lock()
             .map_err(|_| RuntimeControlError::ReloadInProgress)?;
-        let _reload_guard = reload_guard;
+        let _lifecycle_guard = lifecycle_guard;
+
+        self.ensure_not_stopping().await?;
 
         let next_config = self
             .storage
@@ -119,6 +216,12 @@ impl RuntimeControl for RuntimeSupervisor {
 
         let old_slot = {
             let mut state = self.state.lock().await;
+            if state.stopping {
+                return Err(RuntimeControlError::ShuttingDown {
+                    reason: "daemon shutdown has started".to_owned(),
+                });
+            }
+
             state.phase = RuntimeLifecycleState::Reloading;
             state
                 .slot
@@ -129,12 +232,24 @@ impl RuntimeControl for RuntimeSupervisor {
         };
 
         let previous_version = old_slot.config.version;
-        let old_shutdown_error = old_slot
-            .runtime
-            .shutdown()
-            .await
-            .err()
-            .map(|error| error.to_string());
+        let candidate_version = next_config.version;
+        if let Err(error) = old_slot.runtime.shutdown().await {
+            let message = format!("old runtime shutdown failed; reload aborted: {error}");
+            self.set_reload_failed(message.clone()).await;
+            let _ = self
+                .record_reload_audit(
+                    audit,
+                    AuditStatus::Failed,
+                    Some(previous_version),
+                    Some(candidate_version),
+                    None,
+                    Some(&error.to_string()),
+                    Some(&message),
+                )
+                .await;
+
+            return Err(RuntimeControlError::UnsafeOldRuntimeShutdown { reason: message });
+        }
 
         match ProjectRuntime::start(
             next_config.clone(),
@@ -146,21 +261,35 @@ impl RuntimeControl for RuntimeSupervisor {
             Ok(runtime) => {
                 let reloaded_at = OffsetDateTime::now_utc();
                 let active_version = next_config.version;
-                let mut state = self.state.lock().await;
-                state.phase = RuntimeLifecycleState::Running;
-                state.slot = Some(RuntimeSlot {
-                    config: next_config,
-                    runtime,
-                    started_at: reloaded_at,
-                });
-                state.last_reload_at = Some(reloaded_at);
-                state.last_reload_error = old_shutdown_error.clone();
+                {
+                    let mut state = self.state.lock().await;
+                    state.phase = RuntimeLifecycleState::Running;
+                    state.slot = Some(RuntimeSlot {
+                        config: next_config,
+                        runtime,
+                        started_at: reloaded_at,
+                    });
+                    state.last_reload_at = Some(reloaded_at);
+                    state.last_reload_error = None;
+                }
+
+                let audit_event_id = self
+                    .record_reload_audit(
+                        audit,
+                        AuditStatus::Succeeded,
+                        Some(previous_version),
+                        Some(candidate_version),
+                        Some(active_version),
+                        None,
+                        None,
+                    )
+                    .await?;
 
                 tracing::info!(
                     project_id = %self.project_id,
                     previous_version,
                     active_version,
-                    reason = reason.as_deref().unwrap_or(""),
+                    audit_event_id = %audit_event_id,
                     "project runtime reloaded"
                 );
 
@@ -169,7 +298,8 @@ impl RuntimeControl for RuntimeSupervisor {
                     previous_version,
                     active_version,
                     reloaded_at,
-                    old_runtime_shutdown_error: old_shutdown_error,
+                    old_runtime_shutdown_error: None,
+                    audit_event_id,
                 })
             }
             Err(start_error) => {
@@ -199,9 +329,28 @@ impl RuntimeControl for RuntimeSupervisor {
                 };
 
                 let message = format!("reload failed: {start_error}; {rollback_message}");
-                let mut state = self.state.lock().await;
-                state.last_reload_at = Some(OffsetDateTime::now_utc());
-                state.last_reload_error = Some(message.clone());
+                {
+                    let mut state = self.state.lock().await;
+                    state.last_reload_at = Some(OffsetDateTime::now_utc());
+                    state.last_reload_error = Some(message.clone());
+                }
+
+                let active_version_after = {
+                    let state = self.state.lock().await;
+                    state.slot.as_ref().map(|slot| slot.config.version)
+                };
+
+                let _ = self
+                    .record_reload_audit(
+                        audit,
+                        AuditStatus::Failed,
+                        Some(previous_version),
+                        Some(candidate_version),
+                        active_version_after,
+                        None,
+                        Some(&message),
+                    )
+                    .await;
 
                 tracing::warn!(project_id = %self.project_id, error = %message, "project runtime reload failed");
 
@@ -213,6 +362,7 @@ impl RuntimeControl for RuntimeSupervisor {
 
 struct RuntimeState {
     phase: RuntimeLifecycleState,
+    stopping: bool,
     slot: Option<RuntimeSlot>,
     last_reload_at: Option<OffsetDateTime>,
     last_reload_error: Option<String>,

@@ -13,12 +13,16 @@ pipe-bolt-domain = { path = "../pipe-bolt-domain" }
 pipe-bolt-storage = { path = "../pipe-bolt-storage" }
 pipe-bolt-api = { path = "../pipe-bolt-api" }
 
-tokio = { version = "1.52.3", features = ["full"] }
-rumqttc = "0.25.1"
-thiserror = "2.0.18"
-serde_json = "1.0.150"
-tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
-tracing = "0.1.44"
-dotenvy = { version = "0.15.7" }
-time = { version = "0.3", features = ["formatting", "parsing", "serde", "serde-well-known"] }
-async-trait = "0.1.89"
+tokio = { workspace = true, features = ["full"] }
+rumqttc = { workspace = true }
+thiserror = { workspace = true }
+serde_json = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter", "fmt"] }
+tracing = { workspace = true }
+dotenvy = { workspace = true, optional = true }
+time = { workspace = true, features = ["formatting", "parsing", "serde", "serde-well-known"] }
+async-trait = { workspace = true }
+
+[features]
+default = []
+dotenvy = ["dep:dotenvy"]

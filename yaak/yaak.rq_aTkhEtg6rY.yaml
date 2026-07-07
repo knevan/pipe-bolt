@@ -1,0 +1,67 @@
+type: http_request
+model: http_request
+id: rq_aTkhEtg6rY
+createdAt: 2026-06-24T18:45:25.972415900
+updatedAt: 2026-06-24T19:00:49.026898900
+workspaceId: wk_RswPFWqsc9
+folderId: fl_38jkvEMWeo
+authentication: {}
+authenticationType: null
+body:
+  sendJsonComments: true
+  text: |-
+    // {
+    //   "resolution": "Manual resolve by administrator after fixing network connection.",
+    //   "reason": "Network issue resolved"
+    // }
+bodyType: application/json
+description: ''
+headers:
+- enabled: true
+  name: Authorization
+  value: Bearer dev_secret_management_token_2026
+  id: QAfmVQemQb
+- enabled: true
+  name: ''
+  value: ''
+  id: YZbSxjrixd
+- enabled: true
+  name: Content-Type
+  value: application/json
+  id: erV7dMPqvu
+method: POST
+name: Failures
+sortPriority: 4000.0
+url: http://127.0.0.1:8081/projects/project-dev-1/failures
+urlParameters:
+- enabled: true
+  name: limit
+  value: '100'
+  id: DrJCCI75vp
+- enabled: true
+  name: before
+  value: 2026-06-25T01:37:49Z
+  id: cIR0QQvmZe
+- enabled: true
+  name: unresolved_only
+  value: 'true'
+  id: FAxkJKrSsv
+- enabled: true
+  name: ''
+  value: ''
+  id: RTmhVISk0d
+settingSendCookies:
+  enabled: false
+  value: true
+settingStoreCookies:
+  enabled: false
+  value: true
+settingValidateCertificates:
+  enabled: false
+  value: true
+settingFollowRedirects:
+  enabled: false
+  value: true
+settingRequestTimeout:
+  enabled: false
+  value: 0

@@ -1,0 +1,41 @@
+type: http_request
+model: http_request
+id: rq_voKLSiKFZT
+createdAt: 2026-06-24T18:34:07.527530300
+updatedAt: 2026-06-24T19:37:27.002520900
+workspaceId: wk_RswPFWqsc9
+folderId: fl_38jkvEMWeo
+authentication: {}
+authenticationType: null
+body: {}
+bodyType: null
+description: ''
+headers:
+- enabled: true
+  name: Authorization
+  value: Bearer dev_secret_management_token_2026
+  id: 8FADiTIadc
+- enabled: true
+  name: ''
+  value: ''
+  id: fqmMxMAsrK
+method: GET
+name: Project Config
+sortPriority: 1000.0
+url: http://127.0.0.1:8081/projects/project-dev-1/config
+urlParameters: []
+settingSendCookies:
+  enabled: false
+  value: true
+settingStoreCookies:
+  enabled: false
+  value: true
+settingValidateCertificates:
+  enabled: false
+  value: true
+settingFollowRedirects:
+  enabled: false
+  value: true
+settingRequestTimeout:
+  enabled: false
+  value: 0

@@ -1,0 +1,28 @@
+type: folder
+model: folder
+id: fl_38jkvEMWeo
+createdAt: 2026-06-24T18:31:57.177111800
+updatedAt: 2026-06-24T18:54:15.422324900
+workspaceId: wk_RswPFWqsc9
+folderId: null
+authentication: {}
+authenticationType: null
+description: ''
+headers: []
+name: pipe-bolt-api
+sortPriority: 1000.0
+settingSendCookies:
+  enabled: false
+  value: true
+settingStoreCookies:
+  enabled: false
+  value: true
+settingValidateCertificates:
+  enabled: false
+  value: true
+settingFollowRedirects:
+  enabled: false
+  value: true
+settingRequestTimeout:
+  enabled: false
+  value: 0

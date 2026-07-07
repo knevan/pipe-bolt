@@ -54,6 +54,18 @@ pub enum StorageError {
     #[error("stored state is invalid: {reason}")]
     InvalidStoredState { reason: &'static str },
 
+    #[error("failure '{failure_id}' was not found for project '{project_id}'")]
+    FailureNotFound {
+        project_id: String,
+        failure_id: String,
+    },
+
+    #[error("failure '{failure_id}' for project '{project_id}' is already resolved")]
+    FailureAlreadyResolved {
+        project_id: String,
+        failure_id: String,
+    },
+
     #[error("domain validation failed: {0}")]
     Domain(#[from] pipe_bolt_domain::DomainError),
 

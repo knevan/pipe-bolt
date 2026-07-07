@@ -1,14 +1,32 @@
 ﻿use std::sync::Arc;
 
-use pipe_bolt_storage::postgres::PostgresStorage;
+use pipe_bolt_domain::UserId;
 use subtle::ConstantTimeEq;
 
 use crate::error::ApiError;
 use crate::runtime_control::RuntimeControl;
+use crate::storage::ManagementStorage;
+
+pub const AUTH_CONTEXT_KEY: &str = "pipe_bolt.auth_context";
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct AuthContext {
+    actor_id: UserId,
+}
+
+impl AuthContext {
+    pub fn new(actor_id: UserId) -> Self {
+        Self { actor_id }
+    }
+
+    pub const fn actor_id(&self) -> &UserId {
+        &self.actor_id
+    }
+}
 
 #[derive(Clone)]
 pub struct ApiState {
-    storage: Arc<PostgresStorage>,
+    storage: Arc<dyn ManagementStorage>,
     runtime: Arc<dyn RuntimeControl>,
     auth: ManagementAuth,
     max_config_body_bytes: usize,
@@ -16,7 +34,7 @@ pub struct ApiState {
 
 impl ApiState {
     pub fn new(
-        storage: Arc<PostgresStorage>,
+        storage: Arc<dyn ManagementStorage>,
         runtime: Arc<dyn RuntimeControl>,
         auth: ManagementAuth,
         max_config_body_bytes: usize,
@@ -29,7 +47,7 @@ impl ApiState {
         }
     }
 
-    pub fn storage(&self) -> &Arc<PostgresStorage> {
+    pub fn storage(&self) -> &Arc<dyn ManagementStorage> {
         &self.storage
     }
 
@@ -41,14 +59,18 @@ impl ApiState {
         self.max_config_body_bytes
     }
 
-    pub fn authorize(&self, authorization_header: Option<&str>) -> Result<(), ApiError> {
-        self.auth.authorize(authorization_header)
+    pub fn authenticate(
+        &self,
+        authorization_header: Option<&str>,
+    ) -> Result<AuthContext, ApiError> {
+        self.auth.authenticate(authorization_header)
     }
 }
 
 #[derive(Clone)]
 pub struct ManagementAuth {
     bearer_token: String,
+    actor_id: UserId,
 }
 
 impl ManagementAuth {
@@ -62,10 +84,11 @@ impl ManagementAuth {
 
         Ok(Self {
             bearer_token: token,
+            actor_id: UserId::new("system:bootstrap-token")?,
         })
     }
 
-    fn authorize(&self, authorization_header: Option<&str>) -> Result<(), ApiError> {
+    fn authenticate(&self, authorization_header: Option<&str>) -> Result<AuthContext, ApiError> {
         let Some(header) = authorization_header else {
             return Err(ApiError::Unauthorized);
         };
@@ -75,9 +98,8 @@ impl ManagementAuth {
         };
 
         let matches = token.as_bytes().ct_eq(self.bearer_token.as_bytes()).into();
-
         if matches {
-            Ok(())
+            Ok(AuthContext::new(self.actor_id.clone()))
         } else {
             Err(ApiError::Unauthorized)
         }
