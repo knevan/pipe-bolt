@@ -11,7 +11,7 @@ use pipe_bolt_api::dto::{
 use pipe_bolt_api::{
     ApiState, ManagementAuth, ManagementStorage, RuntimeControl, RuntimeControlError,
     management_router,
-};  
+};
 use pipe_bolt_domain::{
     BackpressurePolicy, BrokerConnectionConfig, BrokerId, DeviceIdExtraction, MqttCredentials,
     MqttQos, PayloadCodecKind, ProjectConfig, ProjectId, ReconnectPolicy, SecretString, TlsMode,

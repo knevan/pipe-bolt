@@ -235,7 +235,7 @@ enum RuntimeOwner {
 }
 
 impl RuntimeOwner {
-    async fn shutdown(self) -> Result<(), crate::runtime::RuntimeError> {
+    async fn shutdown(self) -> Result<(), runtime::RuntimeError> {
         match self {
             Self::Standalone(runtime) => {
                 if let Some(runtime) = runtime {
