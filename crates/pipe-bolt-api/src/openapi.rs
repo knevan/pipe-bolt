@@ -1,7 +1,10 @@
+#[cfg(feature = "salvo-oapi")]
 use salvo::oapi::security::{Http, HttpAuthScheme, SecurityScheme};
+#[cfg(feature = "salvo-oapi")]
 use salvo::oapi::{Info, OpenApi};
 use salvo::prelude::*;
 
+#[cfg(feature = "salvo-oapi")]
 pub fn attach_openapi(router: Router) -> Router {
     let doc = OpenApi::new("Pipe Bolt Management API", env!("CARGO_PKG_VERSION"))
         .info(
@@ -17,5 +20,10 @@ pub fn attach_openapi(router: Router) -> Router {
 
     router
         .unshift(doc.into_router("/api-doc/openapi.json"))
-        .unshift(SwaggerUi::new("/api-doc/openapi.json").into_router("/swagger-ui"))
+        .unshift(Scalar::new("/api-doc/openapi.json").into_router("/scalar"))
+}
+
+#[cfg(not(feature = "salvo-oapi"))]
+pub fn attach_openapi(router: Router) -> Router {
+    router
 }

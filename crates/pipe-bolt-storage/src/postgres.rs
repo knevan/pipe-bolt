@@ -3,7 +3,9 @@ use std::time::Duration;
 
 use base64::Engine;
 use base64::prelude::BASE64_STANDARD_NO_PAD;
-use pipe_bolt_domain::{EventId, ProjectConfig, ProjectId, SinkId, UserId};
+use pipe_bolt_domain::{
+    CommandExecutionId, EventId, MqttQos, ProjectConfig, ProjectId, SinkId, UserId,
+};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use sqlx::migrate::Migrator;
@@ -14,9 +16,10 @@ use uuid::Uuid;
 
 use crate::error::StorageError;
 use crate::model::{
-    AuditContext, AuditEventRecord, AuditStatus, FailureEventRecord, FailureListQuery,
-    FailureSeverity, NewAuditEvent, NewFailureEvent, NewSinkDeliveryOutcome, OperationalListQuery,
-    ProjectConfigWriteResult, RetentionConfig, SinkDeliveryOutcomeRecord, SinkDeliveryStatus,
+    AuditContext, AuditEventRecord, AuditStatus, CommandExecutionRecord, CommandExecutionStatus,
+    FailureEventRecord, FailureListQuery, FailureSeverity, NewAuditEvent, NewCommandExecution,
+    NewFailureEvent, NewSinkDeliveryOutcome, OperationalListQuery, ProjectConfigWriteResult,
+    RetentionConfig, SinkDeliveryOutcomeRecord, SinkDeliveryStatus,
 };
 use crate::project_config_codec::{ProjectConfigCodec, StoredProjectConfig};
 use crate::secret::SecretCipher;
@@ -96,6 +99,11 @@ impl PostgresStorage {
 
     pub async fn migrate(&self) -> Result<(), StorageError> {
         MIGRATOR.run(&self.pool).await?;
+        Ok(())
+    }
+
+    pub async fn health_check(&self) -> Result<(), StorageError> {
+        sqlx::query("SELECT 1").execute(&self.pool).await?;
         Ok(())
     }
 
@@ -315,6 +323,98 @@ impl PostgresStorage {
 
         tx.commit().await?;
         Ok(delivery_id)
+    }
+
+    pub async fn record_command_execution(
+        &self,
+        execution: NewCommandExecution,
+    ) -> Result<CommandExecutionRecord, StorageError> {
+        validate_command_execution(&execution)?;
+
+        let command_execution_id = generated_id("command_exec");
+        let payload_size_bytes = u64_to_i64("payload_size_bytes", execution.payload_size_bytes)?;
+        let actor_id = execution.actor_id.as_ref().map(ToString::to_string);
+        let mut tx = self.pool.begin().await?;
+
+        let row = sqlx::query(
+            r#"
+            INSERT INTO command_executions (
+                command_execution_id, project_id, command_template_id, broker_id,
+                actor_id, status, topic, qos, retain, payload_size_bytes, failure_reason
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+            RETURNING occurred_at
+            "#,
+        )
+        .bind(command_execution_id.as_str())
+        .bind(execution.project_id.as_str())
+        .bind(execution.command_template_id.as_str())
+        .bind(execution.broker_id.as_str())
+        .bind(actor_id.as_deref())
+        .bind(execution.status.as_str())
+        .bind(execution.topic.as_str())
+        .bind(mqtt_qos_name(execution.qos))
+        .bind(execution.retain)
+        .bind(payload_size_bytes)
+        .bind(execution.failure_reason.as_deref())
+        .fetch_one(&mut *tx)
+        .await?;
+
+        let mut metadata = serde_json::Map::new();
+        metadata.insert(
+            "command_execution_id".to_owned(),
+            json!(command_execution_id),
+        );
+        metadata.insert(
+            "command_template_id".to_owned(),
+            json!(execution.command_template_id),
+        );
+        metadata.insert("broker_id".to_owned(), json!(execution.broker_id));
+        metadata.insert("topic".to_owned(), json!(execution.topic));
+        metadata.insert("status".to_owned(), json!(execution.status.as_str()));
+        metadata.insert(
+            "payload_size_bytes".to_owned(),
+            json!(execution.payload_size_bytes),
+        );
+        if let Some(failure_reason) = &execution.failure_reason {
+            metadata.insert("failure_reason".to_owned(), json!(failure_reason));
+        }
+
+        let audit_event_id = insert_audit_event_tx(
+            &mut tx,
+            NewAuditEvent {
+                project_id: Some(execution.project_id.clone()),
+                actor_id: execution.actor_id.clone(),
+                action: "command.execute".to_owned(),
+                target_type: "command_template".to_owned(),
+                target_id: execution.command_template_id.to_string(),
+                status: if execution.status == CommandExecutionStatus::Failed {
+                    AuditStatus::Failed
+                } else {
+                    AuditStatus::Succeeded
+                },
+                reason: execution.reason.clone(),
+                metadata,
+            },
+        )
+        .await?;
+
+        tx.commit().await?;
+        Ok(CommandExecutionRecord {
+            command_execution_id: CommandExecutionId::new(command_execution_id)?,
+            project_id: execution.project_id,
+            command_template_id: execution.command_template_id,
+            broker_id: execution.broker_id,
+            actor_id: execution.actor_id,
+            status: execution.status,
+            topic: execution.topic,
+            qos: execution.qos,
+            retain: execution.retain,
+            payload_size_bytes: execution.payload_size_bytes,
+            failure_reason: execution.failure_reason,
+            occurred_at: row.try_get("occurred_at")?,
+            audit_event_id,
+        })
     }
 
     pub async fn record_audit_event(&self, event: NewAuditEvent) -> Result<String, StorageError> {
@@ -860,6 +960,17 @@ fn validate_sink_delivery_outcome(outcome: &NewSinkDeliveryOutcome) -> Result<()
     Ok(())
 }
 
+fn validate_command_execution(execution: &NewCommandExecution) -> Result<(), StorageError> {
+    validate_bounded_text("topic", &execution.topic, 1024)?;
+    if let Some(reason) = &execution.reason {
+        validate_bounded_text("reason", reason, MAX_REASON_BYTES)?;
+    }
+    if let Some(failure_reason) = &execution.failure_reason {
+        validate_bounded_text("failure_reason", failure_reason, MAX_REASON_BYTES)?;
+    }
+    Ok(())
+}
+
 fn validate_retention(retention: RetentionConfig) -> Result<(), StorageError> {
     if retention.audit_retention_days == 0
         || retention.delivery_outcome_retention_days == 0
@@ -932,6 +1043,14 @@ fn hash_config_json(config_json: &serde_json::Value) -> Result<String, StorageEr
 
 fn generated_id(prefix: &str) -> String {
     format!("{prefix}_{}", Uuid::now_v7())
+}
+
+const fn mqtt_qos_name(qos: MqttQos) -> &'static str {
+    match qos {
+        MqttQos::AtMostOnce => "at_most_once",
+        MqttQos::AtLeastOnce => "at_least_once",
+        MqttQos::ExactlyOnce => "exactly_once",
+    }
 }
 
 fn version_to_i64(version: u64) -> Result<i64, StorageError> {

@@ -236,6 +236,15 @@ impl From<RuntimeControlError> for ApiError {
                 message: reason,
                 details: None,
             },
+            RuntimeControlError::CommandTemplateNotFound {
+                command_template_id,
+            } => Self::NotFound {
+                message: format!("command template '{command_template_id}' was not found"),
+            },
+            RuntimeControlError::CommandRejected { reason } => Self::UnprocessableEntity {
+                message: reason,
+                details: None,
+            },
             RuntimeControlError::UnsafeOldRuntimeShutdown { reason } => {
                 Self::ServiceUnavailable { message: reason }
             }

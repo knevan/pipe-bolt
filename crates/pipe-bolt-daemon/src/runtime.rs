@@ -1,4 +1,4 @@
-﻿use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::hash::Hash;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -21,12 +21,10 @@ use pipe_bolt_core::pipeline::normalizer::{EventNormalizer, NormalizerLimits};
 use pipe_bolt_core::pipeline::router::ConfigRouteMatcher;
 use pipe_bolt_core::router::matcher::MqttRouter;
 use pipe_bolt_core::rule::rules::{RuleEngine, RuleEngineLimits};
-use pipe_bolt_core::web::realtime::router::{default_bind_addr, serve_realtime_bridge_with_state};
-use pipe_bolt_core::web::realtime::state::RealtimeBridgeState;
 use pipe_bolt_domain::{
-    ActionIntentTemplate, BackpressurePolicy, BrokerConnectionConfig, BrokerId, MqttQos,
-    NormalizedEvent, PayloadSchemaMapping, ProjectConfig, ProjectId, SinkKind, TlsMode,
-    TopicRouteConfig,
+    ActionIntentTemplate, BackpressurePolicy, BrokerConnectionConfig, BrokerId, CommandTemplate,
+    CommandTemplateId, MqttQos, NormalizedEvent, PayloadSchemaMapping, ProjectConfig, ProjectId,
+    SinkKind, TlsMode, TopicName, TopicRouteConfig,
 };
 use pipe_bolt_storage::postgres::PostgresStorage;
 use rumqttc::QoS;
@@ -42,6 +40,7 @@ use crate::persistence_writer::{
 
 const DEFAULT_REALTIME_EVENT_CAPACITY: usize = 1024;
 const DEFAULT_WORKER_JOIN_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_COMMAND_PAYLOAD_BYTES: usize = 64 * 1024;
 
 type RuntimeDispatcher = ActionDispatcher<RuntimeRealtimeSink, BoundedHttpForwarder>;
 
@@ -66,7 +65,7 @@ impl Default for RuntimeSettings {
             rule_limits: RuleEngineLimits::default(),
             dispatch_limits: DispatchLimits::default(),
             realtime_event_capacity: DEFAULT_REALTIME_EVENT_CAPACITY,
-            realtime_bridge_bind_addr: default_bind_addr(),
+            realtime_bridge_bind_addr: SocketAddr::from(([0, 0, 0, 0], 8080)),
             worker_join_timeout: DEFAULT_WORKER_JOIN_TIMEOUT,
         }
     }
@@ -112,8 +111,28 @@ pub enum RuntimeError {
         policy: &'static str,
     },
 
-    #[error("enabled command templates are not supported by this runtime slice: '{template_id}'")]
-    EnabledCommandTemplateUnsupported { template_id: String },
+    #[error(
+        "enabled command template '{template_id}' references an unknown or disabled broker '{broker_id}'"
+    )]
+    CommandTemplateReferencesUnavailableBroker {
+        template_id: String,
+        broker_id: String,
+    },
+
+    #[error("command template '{template_id}' was not found")]
+    CommandTemplateNotFound { template_id: String },
+
+    #[error("command template '{template_id}' is disabled")]
+    CommandTemplateDisabled { template_id: String },
+
+    #[error("broker '{broker_id}' is not running")]
+    CommandBrokerUnavailable { broker_id: String },
+
+    #[error("command template '{template_id}' render failed: {reason}")]
+    CommandTemplateRender { template_id: String, reason: String },
+
+    #[error("command payload is too large: max {max} bytes, got {actual} bytes")]
+    CommandPayloadTooLarge { max: usize, actual: usize },
 
     #[error("enabled rule '{rule_id}' references unknown sink '{sink_id}'")]
     RuleReferencesUnknownSink { rule_id: String, sink_id: String },
@@ -268,7 +287,7 @@ impl RealtimeEventSink for RuntimeRealtimeSink {
 }
 
 pub struct ProjectRuntime {
-    mqtt_engines: Vec<MqttEngine>,
+    mqtt_engines: Vec<BrokerRuntime>,
     shutdown_tx: watch::Sender<bool>,
     workers: Vec<RuntimeWorker>,
     stats: Arc<RuntimeStats>,
@@ -276,6 +295,20 @@ pub struct ProjectRuntime {
     realtime_tx: broadcast::Sender<NormalizedEvent>,
     worker_join_timeout: Duration,
     persistence_writer: Option<RuntimePersistenceWriter>,
+}
+
+pub struct QueuedRuntimeCommand {
+    pub command_template_id: CommandTemplateId,
+    pub broker_id: BrokerId,
+    pub topic: String,
+    pub qos: MqttQos,
+    pub retain: bool,
+    pub payload_size_bytes: u64,
+}
+
+struct BrokerRuntime {
+    broker_id: BrokerId,
+    engine: MqttEngine,
 }
 
 impl ProjectRuntime {
@@ -320,7 +353,10 @@ impl ProjectRuntime {
         let mut mqtt_engines = Vec::with_capacity(pending_brokers.len());
         for pending in pending_brokers {
             match MqttEngine::spawn(pending.config, pending.router) {
-                Ok(engine) => mqtt_engines.push(engine),
+                Ok(engine) => mqtt_engines.push(BrokerRuntime {
+                    broker_id: pending.broker_id,
+                    engine,
+                }),
                 Err(error) => {
                     shutdown_mqtt_engines(mqtt_engines).await;
                     return Err(RuntimeError::from(error));
@@ -356,17 +392,6 @@ impl ProjectRuntime {
                 persistence_handle,
             ),
         ));
-
-        if let Some(engine) = mqtt_engines.first() {
-            let realtime_state = RealtimeBridgeState::new(engine.handle());
-            let bind_addr = settings.realtime_bridge_bind_addr;
-            let shutdown_rx = shutdown_tx.subscribe();
-            workers.push(RuntimeWorker::spawn("legacy-realtime-bridge", async move {
-                serve_realtime_bridge_with_state(bind_addr, realtime_state, shutdown_rx)
-                    .await
-                    .map_err(RuntimeError::from)
-            }));
-        }
 
         tracing::info!(
             project_id = %config.id,
@@ -404,6 +429,52 @@ impl ProjectRuntime {
             .map(|writer| writer.handle().stats())
     }
 
+    pub fn execute_command(
+        &self,
+        config: &ProjectConfig,
+        command_template_id: &CommandTemplateId,
+        params: &BTreeMap<String, serde_json::Value>,
+    ) -> Result<QueuedRuntimeCommand, RuntimeError> {
+        let template = config
+            .command_templates
+            .iter()
+            .find(|template| &template.id == command_template_id)
+            .ok_or_else(|| RuntimeError::CommandTemplateNotFound {
+                template_id: command_template_id.to_string(),
+            })?;
+
+        if !template.enabled {
+            return Err(RuntimeError::CommandTemplateDisabled {
+                template_id: command_template_id.to_string(),
+            });
+        }
+
+        let rendered = render_command_template(template, params)?;
+        let engine = self
+            .mqtt_engines
+            .iter()
+            .find(|broker| broker.broker_id == template.broker_id)
+            .ok_or_else(|| RuntimeError::CommandBrokerUnavailable {
+                broker_id: template.broker_id.to_string(),
+            })?;
+
+        engine.engine.handle().try_enqueue_command(
+            rendered.topic.clone(),
+            map_qos(template.qos),
+            template.retain,
+            rendered.payload,
+        )?;
+
+        Ok(QueuedRuntimeCommand {
+            command_template_id: template.id.clone(),
+            broker_id: template.broker_id.clone(),
+            topic: rendered.topic,
+            qos: template.qos,
+            retain: template.retain,
+            payload_size_bytes: rendered.payload_size_bytes,
+        })
+    }
+
     pub async fn shutdown(self) -> Result<(), RuntimeError> {
         let Self {
             mqtt_engines,
@@ -415,14 +486,8 @@ impl ProjectRuntime {
         } = self;
         let mut first_error = None;
 
-        if let Some(writer) = persistence_writer
-            && let Err(error) = writer.shutdown().await
-        {
-            remember_first_error(&mut first_error, RuntimeError::from(error));
-        }
-
-        for engine in mqtt_engines {
-            if let Err(error) = engine.shutdown().await {
+        for broker in mqtt_engines {
+            if let Err(error) = broker.engine.shutdown().await {
                 remember_first_error(&mut first_error, RuntimeError::from(error));
             }
         }
@@ -431,6 +496,12 @@ impl ProjectRuntime {
 
         if let Err(error) = join_workers(workers, worker_join_timeout).await {
             remember_first_error(&mut first_error, error);
+        }
+
+        if let Some(writer) = persistence_writer
+            && let Err(error) = writer.shutdown().await
+        {
+            remember_first_error(&mut first_error, RuntimeError::from(error));
         }
 
         if let Some(error) = first_error {
@@ -460,6 +531,7 @@ impl RuntimeWorker {
 }
 
 struct PendingBrokerRuntime {
+    broker_id: BrokerId,
     config: MqttClientConfig,
     router: MqttRouter,
 }
@@ -501,6 +573,7 @@ fn build_pending_broker_runtimes(
         )?;
 
         pending.push(PendingBrokerRuntime {
+            broker_id: broker.id.clone(),
             config: mqtt_config,
             router,
         });
@@ -684,6 +757,206 @@ fn qos_rank(qos: QoS) -> u8 {
     }
 }
 
+struct RenderedRuntimeCommand {
+    topic: String,
+    payload: Vec<u8>,
+    payload_size_bytes: u64,
+}
+
+fn render_command_template(
+    template: &CommandTemplate,
+    params: &BTreeMap<String, serde_json::Value>,
+) -> Result<RenderedRuntimeCommand, RuntimeError> {
+    let topic = render_topic_template(template, params)?;
+    TopicName::new(topic.as_str()).map_err(|error| RuntimeError::CommandTemplateRender {
+        template_id: template.id.to_string(),
+        reason: error.to_string(),
+    })?;
+
+    let payload_value = render_payload_value(template, &template.payload_template, params)?;
+    let payload = serde_json::to_vec(&payload_value).map_err(|error| {
+        RuntimeError::CommandTemplateRender {
+            template_id: template.id.to_string(),
+            reason: error.to_string(),
+        }
+    })?;
+    if payload.len() > MAX_COMMAND_PAYLOAD_BYTES {
+        return Err(RuntimeError::CommandPayloadTooLarge {
+            max: MAX_COMMAND_PAYLOAD_BYTES,
+            actual: payload.len(),
+        });
+    }
+
+    Ok(RenderedRuntimeCommand {
+        topic,
+        payload_size_bytes: saturating_usize_to_u64(payload.len()),
+        payload,
+    })
+}
+
+fn render_topic_template(
+    template: &CommandTemplate,
+    params: &BTreeMap<String, serde_json::Value>,
+) -> Result<String, RuntimeError> {
+    let mut output = String::with_capacity(template.topic_template.len());
+    let mut rest = template.topic_template.as_str();
+
+    while let Some(start) = rest.find('{') {
+        output.push_str(&rest[..start]);
+        let after_start = &rest[start + 1..];
+        let Some(end) = after_start.find('}') else {
+            return Err(template_render_error(
+                template,
+                "unclosed topic placeholder",
+            ));
+        };
+        let key = &after_start[..end];
+        output.push_str(&topic_param(template, key, params)?);
+        rest = &after_start[end + 1..];
+    }
+    output.push_str(rest);
+
+    if output.contains('}') {
+        return Err(template_render_error(
+            template,
+            "unopened topic placeholder",
+        ));
+    }
+
+    Ok(output)
+}
+
+fn render_payload_value(
+    template: &CommandTemplate,
+    value: &serde_json::Value,
+    params: &BTreeMap<String, serde_json::Value>,
+) -> Result<serde_json::Value, RuntimeError> {
+    match value {
+        serde_json::Value::String(text) => render_payload_string(template, text, params),
+        serde_json::Value::Array(values) => values
+            .iter()
+            .map(|value| render_payload_value(template, value, params))
+            .collect::<Result<Vec<_>, _>>()
+            .map(serde_json::Value::Array),
+        serde_json::Value::Object(object) => object
+            .iter()
+            .map(|(key, value)| Ok((key.clone(), render_payload_value(template, value, params)?)))
+            .collect::<Result<serde_json::Map<_, _>, RuntimeError>>()
+            .map(serde_json::Value::Object),
+        _ => Ok(value.clone()),
+    }
+}
+
+fn render_payload_string(
+    template: &CommandTemplate,
+    text: &str,
+    params: &BTreeMap<String, serde_json::Value>,
+) -> Result<serde_json::Value, RuntimeError> {
+    if let Some(key) = exact_placeholder_key(text) {
+        return params
+            .get(key)
+            .cloned()
+            .ok_or_else(|| template_render_error(template, &format!("missing parameter '{key}'")));
+    }
+
+    render_embedded_placeholders(template, text, params).map(serde_json::Value::String)
+}
+
+fn render_embedded_placeholders(
+    template: &CommandTemplate,
+    text: &str,
+    params: &BTreeMap<String, serde_json::Value>,
+) -> Result<String, RuntimeError> {
+    let mut output = String::with_capacity(text.len());
+    let mut rest = text;
+
+    while let Some(start) = rest.find('{') {
+        output.push_str(&rest[..start]);
+        let after_start = &rest[start + 1..];
+        let Some(end) = after_start.find('}') else {
+            return Err(template_render_error(
+                template,
+                "unclosed payload placeholder",
+            ));
+        };
+        let key = &after_start[..end];
+        output.push_str(&scalar_param(template, key, params)?);
+        rest = &after_start[end + 1..];
+    }
+    output.push_str(rest);
+
+    if output.contains('}') {
+        return Err(template_render_error(
+            template,
+            "unopened payload placeholder",
+        ));
+    }
+
+    Ok(output)
+}
+
+fn exact_placeholder_key(text: &str) -> Option<&str> {
+    text.strip_prefix('{')?.strip_suffix('}')
+}
+
+fn topic_param(
+    template: &CommandTemplate,
+    key: &str,
+    params: &BTreeMap<String, serde_json::Value>,
+) -> Result<String, RuntimeError> {
+    let value = scalar_param(template, key, params)?;
+    if value.is_empty()
+        || value.contains('/')
+        || value.contains('+')
+        || value.contains('#')
+        || value.contains('\0')
+        || value.chars().any(char::is_control)
+    {
+        return Err(template_render_error(
+            template,
+            &format!("parameter '{key}' must be a single MQTT topic segment"),
+        ));
+    }
+
+    Ok(value)
+}
+
+fn scalar_param(
+    template: &CommandTemplate,
+    key: &str,
+    params: &BTreeMap<String, serde_json::Value>,
+) -> Result<String, RuntimeError> {
+    if key.trim().is_empty() {
+        return Err(template_render_error(
+            template,
+            "placeholder name must not be empty",
+        ));
+    }
+
+    let value = params
+        .get(key)
+        .ok_or_else(|| template_render_error(template, &format!("missing parameter '{key}'")))?;
+
+    match value {
+        serde_json::Value::String(value) => Ok(value.clone()),
+        serde_json::Value::Number(value) => Ok(value.to_string()),
+        serde_json::Value::Bool(value) => Ok(value.to_string()),
+        serde_json::Value::Null | serde_json::Value::Array(_) | serde_json::Value::Object(_) => {
+            Err(template_render_error(
+                template,
+                &format!("parameter '{key}' must be scalar"),
+            ))
+        }
+    }
+}
+
+fn template_render_error(template: &CommandTemplate, reason: &str) -> RuntimeError {
+    RuntimeError::CommandTemplateRender {
+        template_id: template.id.to_string(),
+        reason: reason.to_owned(),
+    }
+}
+
 async fn consume_forward_outcomes(
     mut outcomes: mpsc::Receiver<ForwardDeliveryOutcome>,
     mut shutdown_rx: watch::Receiver<bool>,
@@ -737,9 +1010,9 @@ fn record_forward_outcome(
     );
 }
 
-async fn shutdown_mqtt_engines(mqtt_engines: Vec<MqttEngine>) {
-    for engine in mqtt_engines {
-        if let Err(error) = engine.shutdown().await {
+async fn shutdown_mqtt_engines(mqtt_engines: Vec<BrokerRuntime>) {
+    for broker in mqtt_engines {
+        if let Err(error) = broker.engine.shutdown().await {
             tracing::warn!(error = %error, "failed to shutdown MQTT engine during startup rollback");
         }
     }
@@ -943,17 +1216,27 @@ fn validate_routes(config: &ProjectConfig) -> Result<(), RuntimeError> {
     Ok(())
 }
 
-/// Validates that there are no enabled command templates, as they are not supported in this slice.
 fn validate_command_templates(config: &ProjectConfig) -> Result<(), RuntimeError> {
-    if let Some(template) = config
+    let enabled_broker_ids = config
+        .brokers
+        .iter()
+        .filter(|broker| broker.enabled)
+        .map(|broker| broker.id.clone())
+        .collect::<HashSet<_>>();
+
+    for template in config
         .command_templates
         .iter()
-        .find(|template| template.enabled)
+        .filter(|template| template.enabled)
     {
-        return Err(RuntimeError::EnabledCommandTemplateUnsupported {
-            template_id: template.id.to_string(),
-        });
+        if !enabled_broker_ids.contains(&template.broker_id) {
+            return Err(RuntimeError::CommandTemplateReferencesUnavailableBroker {
+                template_id: template.id.to_string(),
+                broker_id: template.broker_id.to_string(),
+            });
+        }
     }
+
     Ok(())
 }
 
@@ -1005,6 +1288,7 @@ fn saturating_usize_to_u64(value: usize) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::time::Duration;
 
     use pipe_bolt_domain::{
@@ -1099,25 +1383,47 @@ mod tests {
     }
 
     #[test]
-    fn runtime_rejects_enabled_command_templates() {
+    fn runtime_accepts_enabled_command_template_when_broker_is_enabled() {
         let mut config = project_config();
-        config.command_templates.push(CommandTemplate {
-            id: CommandTemplateId::new("command-1").expect("command template id"),
-            name: "Turn Relay On".to_owned(),
-            broker_id: BrokerId::new("broker-local").expect("broker id"),
-            topic_template: "devices/{device_id}/commands/relay".to_owned(),
-            payload_template: serde_json::json!({ "relay": 1, "state": "on" }),
-            qos: MqttQos::AtLeastOnce,
-            retain: false,
-            enabled: true,
-        });
+        config.command_templates.push(command_template("command-1"));
 
-        let error = validate_runtime_config(&config).expect_err("command template error");
+        validate_runtime_config(&config).expect("enabled command template supported");
+    }
+
+    #[test]
+    fn runtime_rejects_enabled_command_template_when_broker_disabled() {
+        let mut config = project_config();
+        let mut template = command_template("command-1");
+        template.broker_id = BrokerId::new("broker-disabled").expect("broker id");
+        config.brokers.push(broker("broker-disabled", false));
+        config.command_templates.push(template);
+
+        let error = validate_runtime_config(&config).expect_err("command template broker error");
 
         assert!(matches!(
             error,
-            RuntimeError::EnabledCommandTemplateUnsupported { .. }
+            RuntimeError::CommandTemplateReferencesUnavailableBroker { .. }
         ));
+    }
+
+    #[test]
+    fn command_template_should_preserve_json_type_when_payload_is_exact_placeholder() {
+        let template = command_template("command-1");
+        let params = BTreeMap::from([("state".to_owned(), serde_json::json!(true))]);
+
+        let rendered = render_payload_string(&template, "{state}", &params).expect("rendered");
+
+        assert_eq!(rendered, serde_json::json!(true));
+    }
+
+    #[test]
+    fn command_template_should_reject_topic_segment_escape() {
+        let template = command_template("command-1");
+        let params = BTreeMap::from([("device_id".to_owned(), serde_json::json!("a/b"))]);
+
+        let error = render_topic_template(&template, &params).expect_err("segment escape");
+
+        assert!(matches!(error, RuntimeError::CommandTemplateRender { .. }));
     }
 
     #[tokio::test]
@@ -1213,6 +1519,19 @@ mod tests {
             trigger: RuleTrigger::EventReceived,
             condition: None,
             actions: vec![ActionIntentTemplate::StreamToUi],
+        }
+    }
+
+    fn command_template(id: &str) -> CommandTemplate {
+        CommandTemplate {
+            id: CommandTemplateId::new(id).expect("command template id"),
+            name: "Turn Relay On".to_owned(),
+            broker_id: BrokerId::new("broker-local").expect("broker id"),
+            topic_template: "devices/{device_id}/commands/relay".to_owned(),
+            payload_template: serde_json::json!({ "relay": 1, "state": "{state}" }),
+            qos: MqttQos::AtLeastOnce,
+            retain: false,
+            enabled: true,
         }
     }
 

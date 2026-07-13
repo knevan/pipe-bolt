@@ -1,4 +1,4 @@
-﻿// use std::borrow::Cow;
+// use std::borrow::Cow;
 use std::fmt;
 use std::str::FromStr;
 
@@ -11,6 +11,7 @@ const MAX_ID_BYTES: usize = 128;
 macro_rules! define_id {
     ($name:ident, $field:literal) => {
         #[derive(Clone, Eq, PartialEq, Ord, PartialOrd, Hash, Serialize, Deserialize)]
+        #[cfg_attr(feature = "salvo-oapi", derive(salvo::oapi::ToSchema))]
         #[serde(transparent)]
         pub struct $name(String);
 
@@ -128,6 +129,7 @@ pub(crate) fn validate_text(
 
 #[derive(Debug, Clone, Eq, PartialEq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
+#[cfg_attr(feature = "salvo-oapi", derive(salvo::oapi::ToSchema))]
 pub struct FieldPath(String);
 
 impl FieldPath {

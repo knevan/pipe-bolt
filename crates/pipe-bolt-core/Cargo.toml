@@ -22,3 +22,4 @@ uuid = { workspace = true, features = ["v7"] }
 thiserror = { workspace = true }
 time = { workspace = true }
 reqwest = { workspace = true, features = ["stream"] }
+tracing = { workspace = true }

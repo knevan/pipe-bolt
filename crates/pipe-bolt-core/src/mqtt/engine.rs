@@ -170,7 +170,7 @@ async fn run_mqtt_worker(
                     }
                     Err(err) => {
                         let delay = backoff.next_delay();
-                        eprintln!("MQTT event loop error: {}; retrying in {:?}", err, delay);
+                        tracing::warn!(error = %err, ?delay, "MQTT event loop error; reconnecting");
 
                         if wait_or_shutdown(delay, &mut shutdown_rx).await {
                             break;
@@ -195,9 +195,10 @@ async fn handle_mqtt_event(
                     .subscribe(&subscription.topic, subscription.qos)
                     .await
                 {
-                    eprintln!(
-                        "MQTT subscribe error for topic: '{}': {}",
-                        subscription.topic, err
+                    tracing::warn!(
+                        topic = %subscription.topic,
+                        error = %err,
+                        "MQTT subscribe failed"
                     );
                 }
             }
@@ -205,11 +206,11 @@ async fn handle_mqtt_event(
         Event::Incoming(Packet::Publish(publish)) => match MqttMessage::from_publish(publish) {
             Ok(message) => {
                 if let Err(err) = bus.try_enqueue_ingress(message).await {
-                    eprintln!("MQTT ingress enqueue error: {}", err);
+                    tracing::warn!(error = %err, "MQTT ingress enqueue failed");
                 }
             }
             Err(err) => {
-                eprintln!("MQTT message conversion error: {}", err);
+                tracing::warn!(error = %err, "MQTT message conversion failed");
             }
         },
         _ => {
@@ -243,11 +244,11 @@ async fn run_router_worker(
 
                 // Route dispatch runs before telemetry fan-out so application handlers observe the original MQTT message first.
                 if let Err(err) = router.dispatch(message).await {
-                    eprintln!("MQTT route dispatch error: {}", err);
+                    tracing::warn!(error = %err, "MQTT route dispatch failed");
                 }
 
                 if let Err(err) = bus.publish_telemetry(telemetry) {
-                    eprintln!("MQTT telemetry publish error: {}", err);
+                    tracing::warn!(error = %err, "MQTT telemetry publish failed");
                 }
             }
         }
@@ -278,7 +279,7 @@ async fn run_command_worker(
                     command.topic, command.qos, command.retain, command.payload
                 ).await
                 {
-                    eprintln!("MQTT command publish error: {}", err);
+                    tracing::warn!(error = %err, "MQTT command publish failed");
                 }
             }
         }

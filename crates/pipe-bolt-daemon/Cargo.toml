@@ -24,5 +24,9 @@ time = { workspace = true, features = ["formatting", "parsing", "serde", "serde-
 async-trait = { workspace = true }
 
 [features]
-default = []
+dev = [
+    "dotenvy",
+    "pipe-bolt-domain/salvo-oapi",
+    "pipe-bolt-api/salvo-oapi"
+]
 dotenvy = ["dep:dotenvy"]

@@ -13,3 +13,7 @@ serde_json = { workspace = true }
 serde_bytes = { workspace = true }
 thiserror = { workspace = true }
 time = { workspace = true, features = ["formatting", "parsing", "serde", "serde-well-known"] }
+salvo = { package = "salvo", version = "0.93", default-features = false, features = ["oapi"], optional = true }
+
+[features]
+salvo-oapi = ["dep:salvo"]

@@ -1,18 +1,22 @@
-﻿use std::sync::Arc;
+use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use pipe_bolt_api::dto::{
-    ForwarderCountersResponse, PersistenceWriterCountersResponse, RuntimeCountersResponse,
-    RuntimeLifecycleState, RuntimePipelineCountersResponse, RuntimeReloadResponse,
-    RuntimeStatusResponse,
+    CommandExecutionStatusResponse, ExecuteCommandResponse, ForwarderCountersResponse,
+    PersistenceWriterCountersResponse, ReadinessStatus, RuntimeCountersResponse,
+    RuntimeLifecycleState, RuntimePipelineCountersResponse, RuntimeReadinessResponse,
+    RuntimeReloadResponse, RuntimeStatusResponse,
 };
 use pipe_bolt_api::{RuntimeControl, RuntimeControlError};
-use pipe_bolt_domain::{ProjectConfig, ProjectId};
-use pipe_bolt_storage::model::{AuditContext, AuditStatus, NewAuditEvent};
+use pipe_bolt_domain::{CommandTemplateId, NormalizedEvent, ProjectConfig, ProjectId};
+use pipe_bolt_storage::model::{
+    AuditContext, AuditStatus, CommandExecutionStatus, NewAuditEvent, NewCommandExecution,
+};
 use pipe_bolt_storage::postgres::PostgresStorage;
 use serde_json::json;
 use time::OffsetDateTime;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, broadcast};
 
 use crate::runtime::{ProjectRuntime, RuntimePersistence, RuntimeSettings};
 
@@ -149,6 +153,24 @@ impl RuntimeSupervisor {
 
 #[async_trait]
 impl RuntimeControl for RuntimeSupervisor {
+    async fn readiness(&self) -> Result<RuntimeReadinessResponse, RuntimeControlError> {
+        let state = self.state.lock().await;
+        let active_version = state.slot.as_ref().map(|slot| slot.config.version);
+        let ready = state.phase == RuntimeLifecycleState::Running && active_version.is_some();
+
+        Ok(RuntimeReadinessResponse {
+            status: if ready {
+                ReadinessStatus::Ready
+            } else {
+                ReadinessStatus::NotReady
+            },
+            project_id: self.project_id.to_string(),
+            lifecycle: state.phase,
+            active_version,
+            message: state.last_reload_error.clone(),
+        })
+    }
+
     async fn status(
         &self,
         project_id: &ProjectId,
@@ -157,6 +179,23 @@ impl RuntimeControl for RuntimeSupervisor {
 
         let state = self.state.lock().await;
         Ok(status_from_state(&self.project_id, &state))
+    }
+
+    async fn subscribe_realtime_events(
+        &self,
+        project_id: &ProjectId,
+    ) -> Result<broadcast::Receiver<NormalizedEvent>, RuntimeControlError> {
+        self.ensure_project(project_id)?;
+
+        let state = self.state.lock().await;
+        let slot = state
+            .slot
+            .as_ref()
+            .ok_or_else(|| RuntimeControlError::RuntimeUnavailable {
+                reason: "runtime is not running".to_owned(),
+            })?;
+
+        Ok(slot.runtime.subscribe_realtime_events())
     }
 
     async fn validate_candidate_config(
@@ -358,6 +397,66 @@ impl RuntimeControl for RuntimeSupervisor {
             }
         }
     }
+
+    async fn execute_command(
+        &self,
+        project_id: &ProjectId,
+        command_template_id: &CommandTemplateId,
+        params: BTreeMap<String, serde_json::Value>,
+        audit: AuditContext,
+    ) -> Result<ExecuteCommandResponse, RuntimeControlError> {
+        self.ensure_project(project_id)?;
+        self.ensure_not_stopping().await?;
+
+        let queued = {
+            let state = self.state.lock().await;
+            let slot =
+                state
+                    .slot
+                    .as_ref()
+                    .ok_or_else(|| RuntimeControlError::RuntimeUnavailable {
+                        reason: "runtime is not running".to_owned(),
+                    })?;
+
+            slot.runtime
+                .execute_command(&slot.config, command_template_id, &params)
+                .map_err(runtime_command_error_to_control)?
+        };
+
+        let record = self
+            .storage
+            .record_command_execution(NewCommandExecution {
+                project_id: project_id.clone(),
+                command_template_id: queued.command_template_id,
+                broker_id: queued.broker_id,
+                actor_id: audit.actor_id,
+                status: CommandExecutionStatus::Queued,
+                topic: queued.topic,
+                qos: queued.qos,
+                retain: queued.retain,
+                payload_size_bytes: queued.payload_size_bytes,
+                failure_reason: None,
+                reason: audit.reason,
+            })
+            .await
+            .map_err(|error| RuntimeControlError::Storage {
+                reason: error.to_string(),
+            })?;
+
+        Ok(ExecuteCommandResponse {
+            project_id: record.project_id,
+            command_template_id: record.command_template_id,
+            command_execution_id: record.command_execution_id,
+            status: command_status_response(record.status),
+            broker_id: record.broker_id,
+            topic: record.topic,
+            qos: record.qos,
+            retain: record.retain,
+            payload_size_bytes: record.payload_size_bytes,
+            queued_at: record.occurred_at,
+            audit_event_id: record.audit_event_id,
+        })
+    }
 }
 
 struct RuntimeState {
@@ -433,5 +532,45 @@ fn counters_from_runtime(runtime: &ProjectRuntime) -> RuntimeCountersResponse {
                 write_timeout_total: stats.write_timeout_total,
             }
         }),
+    }
+}
+
+fn runtime_command_error_to_control(error: crate::runtime::RuntimeError) -> RuntimeControlError {
+    match error {
+        crate::runtime::RuntimeError::CommandTemplateNotFound { template_id }
+        | crate::runtime::RuntimeError::CommandTemplateDisabled { template_id } => {
+            RuntimeControlError::CommandTemplateNotFound {
+                command_template_id: template_id,
+            }
+        }
+        crate::runtime::RuntimeError::Mqtt(source) => RuntimeControlError::RuntimeUnavailable {
+            reason: source.to_string(),
+        },
+        crate::runtime::RuntimeError::CommandBrokerUnavailable { broker_id } => {
+            RuntimeControlError::RuntimeUnavailable {
+                reason: format!("broker '{broker_id}' is not running"),
+            }
+        }
+        crate::runtime::RuntimeError::CommandTemplateRender { reason, .. } => {
+            RuntimeControlError::CommandRejected { reason }
+        }
+        crate::runtime::RuntimeError::CommandPayloadTooLarge { max, actual } => {
+            RuntimeControlError::CommandRejected {
+                reason: format!(
+                    "command payload is too large: max {max} bytes, got {actual} bytes"
+                ),
+            }
+        }
+        other => RuntimeControlError::RuntimeUnavailable {
+            reason: other.to_string(),
+        },
+    }
+}
+
+const fn command_status_response(status: CommandExecutionStatus) -> CommandExecutionStatusResponse {
+    match status {
+        CommandExecutionStatus::Queued => CommandExecutionStatusResponse::Queued,
+        CommandExecutionStatus::Published => CommandExecutionStatusResponse::Published,
+        CommandExecutionStatus::Failed => CommandExecutionStatusResponse::Failed,
     }
 }

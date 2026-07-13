@@ -9,6 +9,8 @@ use salvo::async_trait;
 
 #[async_trait]
 pub trait ManagementStorage: Send + Sync + 'static {
+    async fn health_check(&self) -> Result<(), StorageError>;
+
     async fn load_project_config(
         &self,
         project_id: &ProjectId,
@@ -50,6 +52,10 @@ pub trait ManagementStorage: Send + Sync + 'static {
 
 #[async_trait]
 impl ManagementStorage for PostgresStorage {
+    async fn health_check(&self) -> Result<(), StorageError> {
+        PostgresStorage::health_check(self).await
+    }
+
     async fn load_project_config(
         &self,
         project_id: &ProjectId,

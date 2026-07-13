@@ -40,7 +40,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     #[cfg(feature = "dotenvy")]
     {
         if let Err(error) = dotenvy::dotenv() {
-            eprintln!("Warning: Failed to load .env file: {error}");
+            tracing::warn!(error = %error, "failed to load .env file");
         }
     }
 
@@ -115,7 +115,12 @@ async fn start_management_api_if_configured(
         Arc::clone(storage),
     ));
 
-    let auth = ManagementAuth::bearer(api_config.bearer_token.clone())?;
+    let auth = ManagementAuth::bearer_with_context(
+        api_config.bearer_token.clone(),
+        api_config.actor_id.clone(),
+        api_config.role,
+        api_config.project_scope.clone(),
+    )?;
     let api_storage: Arc<dyn ManagementStorage> = Arc::<PostgresStorage>::clone(storage);
     let api_runtime: Arc<dyn pipe_bolt_api::RuntimeControl> =
         Arc::<RuntimeSupervisor>::clone(&supervisor);

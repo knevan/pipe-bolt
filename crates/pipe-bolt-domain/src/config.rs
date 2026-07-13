@@ -1,4 +1,4 @@
-﻿use std::fmt;
+use std::fmt;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize, Serializer};
@@ -68,6 +68,7 @@ impl ProjectConfig {
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "salvo-oapi", derive(salvo::oapi::ToSchema))]
 pub struct BrokerConnectionConfig {
     pub id: BrokerId,
     pub name: String,
@@ -76,6 +77,7 @@ pub struct BrokerConnectionConfig {
     pub tls: TlsMode,
     pub credentials: Option<MqttCredentials>,
     #[serde(with = "duration_seconds")]
+    #[cfg_attr(feature = "salvo-oapi", salvo(schema(value_type = u64)))]
     pub keep_alive: Duration,
     pub clean_session: bool,
     pub client_id: String,
@@ -108,12 +110,15 @@ impl BrokerConnectionConfig {
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "salvo-oapi", derive(salvo::oapi::ToSchema))]
 pub enum TlsMode {
     Disabled,
     NativeRoots,
 }
 
 #[derive(Clone, Eq, PartialEq, Deserialize)]
+#[cfg_attr(feature = "salvo-oapi", derive(salvo::oapi::ToSchema))]
+#[cfg_attr(feature = "salvo-oapi", salvo(schema(value_type = String)))]
 pub struct SecretString(String);
 
 impl SecretString {
@@ -144,6 +149,7 @@ impl Serialize for SecretString {
 }
 
 #[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "salvo-oapi", derive(salvo::oapi::ToSchema))]
 pub struct MqttCredentials {
     pub username: String,
     pub password: SecretString,
@@ -166,10 +172,13 @@ impl fmt::Debug for MqttCredentials {
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "salvo-oapi", derive(salvo::oapi::ToSchema))]
 pub struct ReconnectPolicy {
     #[serde(with = "duration_millis")]
+    #[cfg_attr(feature = "salvo-oapi", salvo(schema(value_type = u64)))]
     pub min_delay: Duration,
     #[serde(with = "duration_millis")]
+    #[cfg_attr(feature = "salvo-oapi", salvo(schema(value_type = u64)))]
     pub max_delay: Duration,
 }
 
@@ -201,6 +210,7 @@ impl ReconnectPolicy {
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "salvo-oapi", derive(salvo::oapi::ToSchema))]
 pub struct TopicRouteConfig {
     pub id: RouteId,
     pub broker_id: BrokerId,
@@ -225,6 +235,7 @@ impl TopicRouteConfig {
 
 #[derive(Debug, Clone, Eq, PartialEq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
+#[cfg_attr(feature = "salvo-oapi", derive(salvo::oapi::ToSchema))]
 pub struct TopicFilter(String);
 
 impl TopicFilter {
@@ -269,6 +280,7 @@ impl TopicFilter {
 
 #[derive(Debug, Clone, Eq, PartialEq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
+#[cfg_attr(feature = "salvo-oapi", derive(salvo::oapi::ToSchema))]
 pub struct TopicName(String);
 
 impl TopicName {
@@ -292,6 +304,7 @@ impl TopicName {
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "salvo-oapi", derive(salvo::oapi::ToSchema))]
 pub enum PayloadCodecKind {
     Json,
     Raw,
@@ -299,6 +312,7 @@ pub enum PayloadCodecKind {
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "salvo-oapi", derive(salvo::oapi::ToSchema))]
 pub enum MqttQos {
     AtMostOnce,
     AtLeastOnce,
@@ -307,6 +321,7 @@ pub enum MqttQos {
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
+#[cfg_attr(feature = "salvo-oapi", derive(salvo::oapi::ToSchema))]
 pub enum DeviceIdExtraction {
     None,
     Static { value: String },
@@ -316,6 +331,7 @@ pub enum DeviceIdExtraction {
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "salvo-oapi", derive(salvo::oapi::ToSchema))]
 pub enum BackpressurePolicy {
     DropNewest,
     DropOldest,
@@ -324,6 +340,7 @@ pub enum BackpressurePolicy {
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "salvo-oapi", derive(salvo::oapi::ToSchema))]
 pub struct PayloadSchemaMapping {
     pub id: SchemaMappingId,
     pub name: String,
@@ -343,6 +360,7 @@ impl PayloadSchemaMapping {
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "salvo-oapi", derive(salvo::oapi::ToSchema))]
 pub struct FieldMapping {
     pub source: FieldPath,
     pub target: String,
@@ -359,6 +377,7 @@ impl FieldMapping {
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[cfg_attr(feature = "salvo-oapi", derive(salvo::oapi::ToSchema))]
 pub enum FieldValueType {
     String,
     Number,
@@ -368,6 +387,7 @@ pub enum FieldValueType {
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "salvo-oapi", derive(salvo::oapi::ToSchema))]
 pub struct CommandTemplate {
     pub id: CommandTemplateId,
     pub name: String,
@@ -391,6 +411,7 @@ impl CommandTemplate {
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "salvo-oapi", derive(salvo::oapi::ToSchema))]
 pub struct SinkDefinition {
     pub id: SinkId,
     pub name: String,
@@ -406,12 +427,14 @@ impl SinkDefinition {
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
+#[cfg_attr(feature = "salvo-oapi", derive(salvo::oapi::ToSchema))]
 pub enum SinkKind {
     Webhook {
         url: String,
         method: HttpMethod,
         headers: Vec<HttpHeaderTemplate>,
         #[serde(with = "duration_millis")]
+        #[cfg_attr(feature = "salvo-oapi", salvo(schema(value_type = u64)))]
         timeout: Duration,
     },
     Database {
@@ -422,6 +445,7 @@ pub enum SinkKind {
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "UPPERCASE")]
+#[cfg_attr(feature = "salvo-oapi", derive(salvo::oapi::ToSchema))]
 pub enum HttpMethod {
     Post,
     Put,
@@ -429,6 +453,7 @@ pub enum HttpMethod {
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "salvo-oapi", derive(salvo::oapi::ToSchema))]
 pub struct HttpHeaderTemplate {
     pub name: String,
     pub value: SecretString,

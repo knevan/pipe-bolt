@@ -1,7 +1,8 @@
 ﻿use std::net::{AddrParseError, SocketAddr};
 use std::path::{Path, PathBuf};
 
-use pipe_bolt_domain::{ProjectConfig, ProjectId};
+use pipe_bolt_api::{ManagementProjectScope, ManagementRole};
+use pipe_bolt_domain::{ProjectConfig, ProjectId, UserId};
 use pipe_bolt_storage::error::StorageError;
 use thiserror::Error;
 use tokio::fs;
@@ -34,8 +35,12 @@ pub const STORAGE_KEYS_ENV: &str = "PIPE_BOLT_STORAGE_KEYS";
 pub const MANAGEMENT_API_ENABLED_ENV: &str = "PIPE_BOLT_MANAGEMENT_API_ENABLED";
 pub const MANAGEMENT_API_BIND_ADDR_ENV: &str = "PIPE_BOLT_MANAGEMENT_BIND_ADDR";
 pub const MANAGEMENT_API_TOKEN_ENV: &str = "PIPE_BOLT_MANAGEMENT_TOKEN";
+pub const MANAGEMENT_API_ACTOR_ID_ENV: &str = "PIPE_BOLT_MANAGEMENT_ACTOR_ID";
+pub const MANAGEMENT_API_ROLE_ENV: &str = "PIPE_BOLT_MANAGEMENT_ROLE";
+pub const MANAGEMENT_API_PROJECTS_ENV: &str = "PIPE_BOLT_MANAGEMENT_PROJECTS";
 pub const MANAGEMENT_API_MAX_CONFIG_BYTES_ENV: &str = "PIPE_BOLT_MANAGEMENT_MAX_CONFIG_BYTES";
 pub const DEFAULT_MANAGEMENT_API_BIND_ADDR: &str = "127.0.0.1:8081";
+pub const DEFAULT_MANAGEMENT_API_ACTOR_ID: &str = "system:bootstrap-token";
 
 const DEFAULT_MANAGEMENT_API_MAX_CONFIG_BYTES: usize = 1024 * 1024;
 
@@ -143,6 +148,9 @@ impl StorageRuntimeConfig {
 pub struct ManagementApiRuntimeConfig {
     pub bind_addr: SocketAddr,
     pub bearer_token: String,
+    pub actor_id: UserId,
+    pub role: ManagementRole,
+    pub project_scope: ManagementProjectScope,
     pub max_config_body_bytes: usize,
 }
 
@@ -174,6 +182,14 @@ impl ManagementApiRuntimeConfig {
             ));
         }
 
+        let actor_id = std::env::var(MANAGEMENT_API_ACTOR_ID_ENV)
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| DEFAULT_MANAGEMENT_API_ACTOR_ID.to_owned());
+        let actor_id = UserId::new(actor_id)?;
+        let role = parse_management_role()?;
+        let project_scope = parse_management_project_scope()?;
+
         let max_config_body_bytes = env_usize(
             MANAGEMENT_API_MAX_CONFIG_BYTES_ENV,
             DEFAULT_MANAGEMENT_API_MAX_CONFIG_BYTES,
@@ -182,6 +198,9 @@ impl ManagementApiRuntimeConfig {
         Ok(Some(Self {
             bind_addr: parse_socket_addr(&bind_addr)?,
             bearer_token,
+            actor_id,
+            role,
+            project_scope,
             max_config_body_bytes,
         }))
     }
@@ -283,6 +302,9 @@ pub enum ConfigLoadError {
 
     #[error("environment variable {name} has invalid usize value '{value}'")]
     InvalidUsize { name: &'static str, value: String },
+
+    #[error("environment variable {name} has invalid management role '{value}'")]
+    InvalidManagementRole { name: &'static str, value: String },
 }
 
 pub async fn load_project_config(
@@ -430,6 +452,38 @@ fn env_usize(name: &'static str, default: usize) -> Result<usize, ConfigLoadErro
     value
         .parse::<usize>()
         .map_err(|_| ConfigLoadError::InvalidUsize { name, value })
+}
+
+fn parse_management_role() -> Result<ManagementRole, ConfigLoadError> {
+    let Some(value) = std::env::var(MANAGEMENT_API_ROLE_ENV).ok() else {
+        return Ok(ManagementRole::Admin);
+    };
+
+    ManagementRole::parse(&value).ok_or(ConfigLoadError::InvalidManagementRole {
+        name: MANAGEMENT_API_ROLE_ENV,
+        value,
+    })
+}
+
+fn parse_management_project_scope() -> Result<ManagementProjectScope, ConfigLoadError> {
+    let Some(value) = std::env::var(MANAGEMENT_API_PROJECTS_ENV).ok() else {
+        return Ok(ManagementProjectScope::all());
+    };
+
+    let projects = value
+        .split(',')
+        .map(str::trim)
+        .filter(|project_id| !project_id.is_empty())
+        .map(ProjectId::new)
+        .collect::<Result<Vec<_>, _>>()?;
+
+    if projects.is_empty() {
+        return Err(ConfigLoadError::InvalidOptions(
+            "management API project scope must contain at least one project id",
+        ));
+    }
+
+    Ok(ManagementProjectScope::projects(projects))
 }
 
 #[cfg(test)]

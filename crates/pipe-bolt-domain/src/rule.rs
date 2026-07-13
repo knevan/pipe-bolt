@@ -1,10 +1,11 @@
-﻿use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize};
 
 use crate::action::ActionIntentTemplate;
 use crate::error::DomainError;
 use crate::id::{CommandTemplateId, FieldPath, RouteId, RuleId, validate_text};
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "salvo-oapi", derive(salvo::oapi::ToSchema))]
 pub struct RuleDefinition {
     pub id: RuleId,
     pub name: String,
@@ -37,6 +38,7 @@ impl RuleDefinition {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "salvo-oapi", derive(salvo::oapi::ToSchema))]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum RuleTrigger {
     EventReceived,
@@ -46,6 +48,7 @@ pub enum RuleTrigger {
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
+#[cfg_attr(feature = "salvo-oapi", derive(salvo::oapi::ToSchema))]
 pub enum ConditionExpr {
     Exists { field: FieldRef },
     Equals { left: ValueExpr, right: ValueExpr },
@@ -62,6 +65,7 @@ pub enum ConditionExpr {
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
+#[cfg_attr(feature = "salvo-oapi", derive(salvo::oapi::ToSchema))]
 pub enum ValueExpr {
     Field { field: FieldRef },
     Literal { value: serde_json::Value },
@@ -69,6 +73,7 @@ pub enum ValueExpr {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "source", rename_all = "snake_case")]
+#[cfg_attr(feature = "salvo-oapi", derive(salvo::oapi::ToSchema))]
 pub enum FieldRef {
     Event { path: FieldPath },
     Payload { path: FieldPath },

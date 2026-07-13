@@ -1,4 +1,4 @@
-﻿use std::collections::BTreeMap;
+use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
@@ -7,6 +7,7 @@ use crate::id::{BrokerId, CommandExecutionId, CommandTemplateId, EventId, SinkId
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
+#[cfg_attr(feature = "salvo-oapi", derive(salvo::oapi::ToSchema))]
 pub enum ActionIntentTemplate {
     StreamToUi,
     ForwardToSink { sink_id: SinkId },

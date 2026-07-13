@@ -1,4 +1,6 @@
-﻿use pipe_bolt_domain::{EventId, ProjectId, SinkId, UserId};
+﻿use pipe_bolt_domain::{
+    BrokerId, CommandExecutionId, CommandTemplateId, EventId, MqttQos, ProjectId, SinkId, UserId,
+};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
@@ -133,6 +135,57 @@ pub struct SinkDeliveryOutcomeRecord {
     pub attempt: u16,
     #[serde(with = "time::serde::rfc3339")]
     pub occurred_at: OffsetDateTime,
+}
+
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CommandExecutionStatus {
+    Queued,
+    Published,
+    Failed,
+}
+
+impl CommandExecutionStatus {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Published => "published",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct NewCommandExecution {
+    pub project_id: ProjectId,
+    pub command_template_id: CommandTemplateId,
+    pub broker_id: BrokerId,
+    pub actor_id: Option<UserId>,
+    pub status: CommandExecutionStatus,
+    pub topic: String,
+    pub qos: MqttQos,
+    pub retain: bool,
+    pub payload_size_bytes: u64,
+    pub failure_reason: Option<String>,
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct CommandExecutionRecord {
+    pub command_execution_id: CommandExecutionId,
+    pub project_id: ProjectId,
+    pub command_template_id: CommandTemplateId,
+    pub broker_id: BrokerId,
+    pub actor_id: Option<UserId>,
+    pub status: CommandExecutionStatus,
+    pub topic: String,
+    pub qos: MqttQos,
+    pub retain: bool,
+    pub payload_size_bytes: u64,
+    pub failure_reason: Option<String>,
+    #[serde(with = "time::serde::rfc3339")]
+    pub occurred_at: OffsetDateTime,
+    pub audit_event_id: String,
 }
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Serialize, Deserialize)]
