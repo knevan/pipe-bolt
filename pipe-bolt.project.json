@@ -1,0 +1,46 @@
+{
+  "id": "project-dev-1",
+  "name": "Local Development Project",
+  "description": "Project configuration for local development",
+  "enabled": true,
+  "version": 1,
+  "brokers": [
+    {
+      "id": "broker-local",
+      "name": "Local MQTT Broker",
+      "host": "localhost",
+      "port": 1883,
+      "tls": "disabled",
+      "keep_alive": 30,
+      "clean_session": true,
+      "client_id": "pipe-bolt-local-client",
+      "reconnect": {
+        "min_delay": 500,
+        "max_delay": 30000
+      },
+      "enabled": true
+    }
+  ],
+  "routes": [
+    {
+      "id": "route-local-telemetry",
+      "broker_id": "broker-local",
+      "name": "Local Telemetry Route",
+      "topic_filter": "device/+/telemetry",
+      "codec": "json",
+      "schema_mapping_id": null,
+      "device_id": {
+        "type": "topic_wildcard_index",
+        "index": 1
+      },
+      "event_type": "telemetry",
+      "qos": "at_most_once",
+      "enabled": true,
+      "backpressure": "reject"
+    }
+  ],
+  "schema_mappings": [],
+  "rules": [],
+  "command_templates": [],
+  "sinks": []
+}

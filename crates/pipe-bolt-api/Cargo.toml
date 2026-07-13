@@ -12,14 +12,20 @@ pipe-bolt-domain = { path = "../pipe-bolt-domain" }
 pipe-bolt-storage = { path = "../pipe-bolt-storage" }
 
 base64 = { workspace = true }
-salvo = { workspace = true, features = ["affix-state", "oapi"] }
+async-stream = { workspace = true }
+futures-util = { workspace = true }
+salvo = { workspace = true, features = ["affix-state", "logging", "sse", "websocket"] }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 time = { workspace = true, features = ["formatting", "parsing", "serde", "serde-well-known"] }
-tokio = { workspace = true, features = ["macros", "sync"] }
+tokio = { workspace = true, features = ["macros", "sync", "time"] }
 subtle = { workspace = true }
+
+[features]
+salvo-oapi = ["salvo/oapi", "pipe-bolt-domain/salvo-oapi"]
 
 [dev-dependencies]
 salvo = { workspace = true, features = ["test"] }

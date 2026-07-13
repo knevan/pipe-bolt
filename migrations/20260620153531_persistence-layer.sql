@@ -128,6 +128,29 @@ CREATE INDEX sink_delivery_outcomes_failure_idx ON sink_delivery_outcomes (proje
 WHERE
     status <> 'delivered';
 
+CREATE TABLE command_executions (
+    command_execution_id TEXT PRIMARY KEY,
+    project_id TEXT NOT NULL REFERENCES project_configs (project_id) ON DELETE RESTRICT,
+    command_template_id TEXT NOT NULL,
+    broker_id TEXT NOT NULL,
+    actor_id TEXT NULL,
+    status TEXT NOT NULL CHECK (status IN ('queued', 'published', 'failed')),
+    topic TEXT NOT NULL CHECK (octet_length(topic) BETWEEN 1 AND 1024),
+    qos TEXT NOT NULL CHECK (qos IN ('at_most_once', 'at_least_once', 'exactly_once')),
+    retain BOOLEAN NOT NULL,
+    payload_size_bytes BIGINT NOT NULL CHECK (payload_size_bytes >= 0),
+    failure_reason TEXT NULL CHECK (failure_reason IS NULL OR octet_length(failure_reason) <= 1024),
+    occurred_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX command_executions_project_time_idx ON command_executions (project_id, occurred_at DESC);
+
+CREATE INDEX command_executions_template_time_idx ON command_executions (project_id, command_template_id, occurred_at DESC);
+
+CREATE INDEX command_executions_actor_time_idx ON command_executions (actor_id, occurred_at DESC)
+WHERE
+    actor_id IS NOT NULL;
+
 CREATE TABLE failure_events
 (
     failure_id   TEXT PRIMARY KEY,

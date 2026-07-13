@@ -1,4 +1,6 @@
-﻿use pipe_bolt_domain::{BrokerId, ProjectConfig, ProjectId, SecretString, SinkId, SinkKind};
+use pipe_bolt_domain::{
+    BrokerId, CommandTemplateId, ProjectConfig, ProjectId, SecretString, SinkId, SinkKind,
+};
 use pipe_bolt_storage::model::{AuditContext, FailureListQuery, OperationalListQuery};
 use salvo::prelude::*;
 use serde::Serialize;
@@ -6,29 +8,73 @@ use serde::de::DeserializeOwned;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 
+use crate::auth::{AUTH_CONTEXT_KEY, AuthContext, ManagementPermission};
 use crate::dto::{
-    HealthResponse, ListResponse, ProjectConfigResponse, ProjectConfigWriteResponse,
-    ResolveFailureRequest, ResolveFailureResponse, RuntimeReloadRequest,
+    ExecuteCommandRequest, HealthResponse, ListResponse, ProjectConfigResponse,
+    ProjectConfigWriteResponse, ReadinessCheckResponse, ReadinessResponse, ResolveFailureRequest,
+    ResolveFailureResponse, RuntimeReadinessResponse, RuntimeReloadRequest,
     UpdateProjectConfigRequest,
 };
+#[cfg(feature = "salvo-oapi")]
+use crate::dto::{ExecuteCommandResponse, RuntimeReloadResponse, RuntimeStatusResponse};
 use crate::error::{ApiError, write_error_response};
-use crate::state::{AUTH_CONTEXT_KEY, ApiState, AuthContext};
+use crate::state::ApiState;
 
 const DEFAULT_LIST_LIMIT: u32 = 100;
 const MAX_LIST_LIMIT: u32 = 500;
 const REDACTED_SECRET: &str = "<redacted>";
 const RUNTIME_RELOAD_MAX_BODY_BYTES: usize = 8 * 1024;
+const COMMAND_EXECUTE_MAX_BODY_BYTES: usize = 64 * 1024;
 
-#[handler]
+const MANAGEMENT_SERVICE_NAME: &str = "pipe-bolt-management-api";
+
+#[cfg_attr(feature = "salvo-oapi", endpoint(
+    tags("health"),
+    operation_id = "get_health",
+    responses((status_code = 200, description = "Management API liveness", body = HealthResponse))
+))]
+#[cfg_attr(not(feature = "salvo-oapi"), handler)]
 pub async fn get_health(res: &mut Response) {
     render_json(
         res,
         StatusCode::OK,
         &HealthResponse {
-            status: "ok",
-            service: "pipe-bolt-management-api",
+            status: "ok".to_owned(),
+            service: MANAGEMENT_SERVICE_NAME.to_owned(),
         },
     );
+}
+
+#[cfg_attr(feature = "salvo-oapi", endpoint(
+    tags("health"),
+    operation_id = "get_readyz",
+    responses(
+        (status_code = 200, description = "Management API is ready", body = ReadinessResponse),
+        (status_code = 503, description = "Management API is not ready", body = ReadinessResponse)
+    )
+))]
+#[cfg_attr(not(feature = "salvo-oapi"), handler)]
+pub async fn get_readyz(depot: &mut Depot, res: &mut Response) {
+    let response = match readiness_inner(depot).await {
+        Ok(response) => response,
+        Err(error) => {
+            tracing::error!(error = %error, "readiness check failed");
+            ReadinessResponse::from_checks(
+                MANAGEMENT_SERVICE_NAME,
+                ReadinessCheckResponse::not_ready("storage check failed"),
+                RuntimeReadinessResponse {
+                    status: crate::dto::ReadinessStatus::NotReady,
+                    project_id: "unknown".to_owned(),
+                    lifecycle: crate::dto::RuntimeLifecycleState::Stopped,
+                    active_version: None,
+                    message: Some("runtime readiness unavailable".to_owned()),
+                },
+            )
+        }
+    };
+    let status = response.status.http_status();
+
+    render_json(res, status, &response);
 }
 
 #[handler]
@@ -61,7 +107,18 @@ pub async fn require_management_auth(
     }
 }
 
-#[handler]
+#[cfg_attr(feature = "salvo-oapi", endpoint(
+    tags("config"),
+    operation_id = "get_project_config",
+    security(("bearer_auth" = [])),
+    responses(
+        (status_code = 200, description = "Active project configuration", body = ProjectConfigResponse),
+        (status_code = 401, description = "Unauthorized"),
+        (status_code = 403, description = "Forbidden"),
+        (status_code = 404, description = "Project config not found")
+    )
+))]
+#[cfg_attr(not(feature = "salvo-oapi"), handler)]
 pub async fn get_project_config(req: &mut Request, depot: &mut Depot, res: &mut Response) {
     match get_project_config_inner(req, depot).await {
         Ok(response) => render_json(res, StatusCode::OK, &response),
@@ -69,7 +126,18 @@ pub async fn get_project_config(req: &mut Request, depot: &mut Depot, res: &mut 
     }
 }
 
-#[handler]
+#[cfg_attr(feature = "salvo-oapi", endpoint(
+    tags("config"),
+    operation_id = "put_project_config",
+    security(("bearer_auth" = [])),
+    responses(
+        (status_code = 200, description = "Configuration successfully updated", body = ProjectConfigWriteResponse),
+        (status_code = 400, description = "Invalid request or version mismatch"),
+        (status_code = 401, description = "Unauthorized"),
+        (status_code = 403, description = "Forbidden")
+    )
+))]
+#[cfg_attr(not(feature = "salvo-oapi"), handler)]
 pub async fn put_project_config(req: &mut Request, depot: &mut Depot, res: &mut Response) {
     match put_project_config_inner(req, depot).await {
         Ok(response) => render_json(res, StatusCode::OK, &response),
@@ -77,7 +145,16 @@ pub async fn put_project_config(req: &mut Request, depot: &mut Depot, res: &mut 
     }
 }
 
-#[handler]
+#[cfg_attr(feature = "salvo-oapi", endpoint(
+    tags("audit"),
+    operation_id = "get_audit_events",
+    security(("bearer_auth" = [])),
+    responses(
+        (status_code = 200, description = "List of audit event records"),
+        (status_code = 401, description = "Unauthorized")
+    )
+))]
+#[cfg_attr(not(feature = "salvo-oapi"), handler)]
 pub async fn get_audit_events(req: &mut Request, depot: &mut Depot, res: &mut Response) {
     match get_audit_events_inner(req, depot).await {
         Ok(response) => render_json(res, StatusCode::OK, &response),
@@ -85,7 +162,15 @@ pub async fn get_audit_events(req: &mut Request, depot: &mut Depot, res: &mut Re
     }
 }
 
-#[handler]
+#[cfg_attr(feature = "salvo-oapi", endpoint(
+    tags("failure"),
+    operation_id = "get_failures",
+    security(("bearer_auth" = [])),
+    responses(
+        (status_code = 200, description = "List of ingestion/processing failures")
+    )
+))]
+#[cfg_attr(not(feature = "salvo-oapi"), handler)]
 pub async fn get_failures(req: &mut Request, depot: &mut Depot, res: &mut Response) {
     match get_failures_inner(req, depot).await {
         Ok(response) => render_json(res, StatusCode::OK, &response),
@@ -93,7 +178,17 @@ pub async fn get_failures(req: &mut Request, depot: &mut Depot, res: &mut Respon
     }
 }
 
-#[handler]
+#[cfg_attr(feature = "salvo-oapi", endpoint(
+    tags("failure"),
+    operation_id = "resolve_failure",
+    security(("bearer_auth" = [])),
+    responses(
+        (status_code = 200, description = "Failure resolved", body = ResolveFailureResponse),
+        (status_code = 404, description = "Failure event not found"),
+        (status_code = 409, description = "Failure already resolved")
+    )
+))]
+#[cfg_attr(not(feature = "salvo-oapi"), handler)]
 pub async fn resolve_failure(req: &mut Request, depot: &mut Depot, res: &mut Response) {
     match resolve_failure_inner(req, depot).await {
         Ok(response) => render_json(res, StatusCode::OK, &response),
@@ -101,7 +196,15 @@ pub async fn resolve_failure(req: &mut Request, depot: &mut Depot, res: &mut Res
     }
 }
 
-#[handler]
+#[cfg_attr(feature = "salvo-oapi", endpoint(
+    tags("etl"),
+    operation_id = "get_delivery_outcomes",
+    security(("bearer_auth" = [])),
+    responses(
+        (status_code = 200, description = "List of sink delivery outcome records")
+    )
+))]
+#[cfg_attr(not(feature = "salvo-oapi"), handler)]
 pub async fn get_delivery_outcomes(req: &mut Request, depot: &mut Depot, res: &mut Response) {
     match get_delivery_outcomes_inner(req, depot).await {
         Ok(response) => render_json(res, StatusCode::OK, &response),
@@ -109,7 +212,15 @@ pub async fn get_delivery_outcomes(req: &mut Request, depot: &mut Depot, res: &m
     }
 }
 
-#[handler]
+#[cfg_attr(feature = "salvo-oapi", endpoint(
+    tags("runtime"),
+    operation_id = "get_runtime_status",
+    security(("bearer_auth" = [])),
+    responses(
+        (status_code = 200, description = "Active runtime metrics and connection statuses", body = RuntimeStatusResponse)
+    )
+))]
+#[cfg_attr(not(feature = "salvo-oapi"), handler)]
 pub async fn get_runtime_status(req: &mut Request, depot: &mut Depot, res: &mut Response) {
     match get_runtime_status_inner(req, depot).await {
         Ok(response) => render_json(res, StatusCode::OK, &response),
@@ -117,12 +228,56 @@ pub async fn get_runtime_status(req: &mut Request, depot: &mut Depot, res: &mut 
     }
 }
 
-#[handler]
+#[cfg_attr(feature = "salvo-oapi", endpoint(
+    tags("command"),
+    operation_id = "post_execute_command",
+    security(("bearer_auth" = [])),
+    responses(
+        (status_code = 202, description = "Command execution queued", body = ExecuteCommandResponse),
+        (status_code = 400, description = "Invalid execution parameters"),
+        (status_code = 404, description = "Command template not found")
+    )
+))]
+#[cfg_attr(not(feature = "salvo-oapi"), handler)]
+pub async fn post_execute_command(req: &mut Request, depot: &mut Depot, res: &mut Response) {
+    match post_execute_command_inner(req, depot).await {
+        Ok(response) => render_json(res, StatusCode::ACCEPTED, &response),
+        Err(error) => render_error(res, error),
+    }
+}
+
+#[cfg_attr(feature = "salvo-oapi", endpoint(
+    tags("runtime"),
+    operation_id = "post_runtime_reload",
+    security(("bearer_auth" = [])),
+    responses(
+        (status_code = 200, description = "Runtime configuration successfully reloaded", body = RuntimeReloadResponse)
+    )
+))]
+#[cfg_attr(not(feature = "salvo-oapi"), handler)]
 pub async fn post_runtime_reload(req: &mut Request, depot: &mut Depot, res: &mut Response) {
     match post_runtime_reload_inner(req, depot).await {
         Ok(response) => render_json(res, StatusCode::OK, &response),
         Err(error) => render_error(res, error),
     }
+}
+
+async fn readiness_inner(depot: &Depot) -> Result<ReadinessResponse, ApiError> {
+    let state = authorized_state(depot)?;
+    let storage = match state.storage().health_check().await {
+        Ok(()) => ReadinessCheckResponse::ready(),
+        Err(error) => {
+            tracing::warn!(error = %error, "management API storage readiness check failed");
+            ReadinessCheckResponse::not_ready("storage check failed")
+        }
+    };
+    let runtime = state.runtime().readiness().await?;
+
+    Ok(ReadinessResponse::from_checks(
+        MANAGEMENT_SERVICE_NAME,
+        storage,
+        runtime,
+    ))
 }
 
 async fn get_project_config_inner(
@@ -131,6 +286,7 @@ async fn get_project_config_inner(
 ) -> Result<ProjectConfigResponse, ApiError> {
     let state = authorized_state(depot)?;
     let project_id = path_project_id(req)?;
+    authorize_project(depot, &project_id, ManagementPermission::ProjectRead)?;
     let config = state
         .storage()
         .load_project_config(&project_id)
@@ -147,8 +303,13 @@ async fn put_project_config_inner(
     depot: &mut Depot,
 ) -> Result<ProjectConfigWriteResponse, ApiError> {
     let state = authorized_state(depot)?;
-    let auth = auth_context(depot)?.clone();
     let path_project_id = path_project_id(req)?;
+    let auth = authorize_project(
+        depot,
+        &path_project_id,
+        ManagementPermission::ProjectConfigWrite,
+    )?
+    .clone();
     ensure_declared_body_size(req, state.max_config_body_bytes())?;
     let body = req
         .parse_json_with_max_size::<UpdateProjectConfigRequest>(state.max_config_body_bytes())
@@ -207,6 +368,7 @@ async fn get_audit_events_inner(
 ) -> Result<ListResponse<pipe_bolt_storage::model::AuditEventRecord>, ApiError> {
     let state = authorized_state(depot)?;
     let project_id = path_project_id(req)?;
+    authorize_project(depot, &project_id, ManagementPermission::ProjectRead)?;
     let query = list_query(req)?;
     let items = state
         .storage()
@@ -223,6 +385,7 @@ async fn get_failures_inner(
 ) -> Result<ListResponse<pipe_bolt_storage::model::FailureEventRecord>, ApiError> {
     let state = authorized_state(depot)?;
     let project_id = path_project_id(req)?;
+    authorize_project(depot, &project_id, ManagementPermission::ProjectRead)?;
     let list = list_query(req)?;
     let unresolved_only = optional_bool_query(req, "unresolved_only")?.unwrap_or(false);
     let query = FailureListQuery {
@@ -241,8 +404,8 @@ async fn resolve_failure_inner(
     depot: &mut Depot,
 ) -> Result<ResolveFailureResponse, ApiError> {
     let state = authorized_state(depot)?;
-    let auth = auth_context(depot)?.clone();
     let project_id = path_project_id(req)?;
+    let auth = authorize_project(depot, &project_id, ManagementPermission::FailureResolve)?.clone();
     let failure_id = path_param(req, "failure_id")?;
     let body = req
         .parse_json_with_max_size::<ResolveFailureRequest>(16 * 1024)
@@ -273,6 +436,7 @@ async fn get_delivery_outcomes_inner(
 ) -> Result<ListResponse<pipe_bolt_storage::model::SinkDeliveryOutcomeRecord>, ApiError> {
     let state = authorized_state(depot)?;
     let project_id = path_project_id(req)?;
+    authorize_project(depot, &project_id, ManagementPermission::ProjectRead)?;
     let query = list_query(req)?;
     let items = state
         .storage()
@@ -289,6 +453,7 @@ async fn get_runtime_status_inner(
 ) -> Result<crate::dto::RuntimeStatusResponse, ApiError> {
     let state = authorized_state(depot)?;
     let project_id = path_project_id(req)?;
+    authorize_project(depot, &project_id, ManagementPermission::ProjectRead)?;
     Ok(state.runtime().status(&project_id).await?)
 }
 
@@ -297,8 +462,8 @@ async fn post_runtime_reload_inner(
     depot: &mut Depot,
 ) -> Result<crate::dto::RuntimeReloadResponse, ApiError> {
     let state = authorized_state(depot)?;
-    let auth = auth_context(depot)?.clone();
     let project_id = path_project_id(req)?;
+    let auth = authorize_project(depot, &project_id, ManagementPermission::RuntimeReload)?.clone();
     ensure_declared_body_size(req, RUNTIME_RELOAD_MAX_BODY_BYTES)?;
     let body = parse_optional_json_with_max_size::<RuntimeReloadRequest>(
         req,
@@ -310,6 +475,36 @@ async fn post_runtime_reload_inner(
     Ok(state
         .runtime()
         .reload(&project_id, audit_context(&auth, body.reason))
+        .await?)
+}
+
+async fn post_execute_command_inner(
+    req: &mut Request,
+    depot: &mut Depot,
+) -> Result<crate::dto::ExecuteCommandResponse, ApiError> {
+    let state = authorized_state(depot)?;
+    let project_id = path_project_id(req)?;
+    let command_template_id = CommandTemplateId::new(path_param(req, "command_template_id")?)?;
+    let auth = authorize_project(depot, &project_id, ManagementPermission::CommandExecute)?.clone();
+    ensure_declared_body_size(req, COMMAND_EXECUTE_MAX_BODY_BYTES)?;
+    let body = parse_optional_json_with_max_size::<ExecuteCommandRequest>(
+        req,
+        COMMAND_EXECUTE_MAX_BODY_BYTES,
+    )
+    .await?
+    .unwrap_or(ExecuteCommandRequest {
+        params: Default::default(),
+        reason: None,
+    });
+
+    Ok(state
+        .runtime()
+        .execute_command(
+            &project_id,
+            &command_template_id,
+            body.params,
+            audit_context(&auth, body.reason),
+        )
         .await?)
 }
 
@@ -337,6 +532,16 @@ fn auth_context(depot: &Depot) -> Result<&AuthContext, ApiError> {
     depot
         .get::<AuthContext>(AUTH_CONTEXT_KEY)
         .map_err(|_| ApiError::Unauthorized)
+}
+
+fn authorize_project<'a>(
+    depot: &'a Depot,
+    project_id: &ProjectId,
+    permission: ManagementPermission,
+) -> Result<&'a AuthContext, ApiError> {
+    let auth = auth_context(depot)?;
+    auth.authorize_project(project_id, permission)?;
+    Ok(auth)
 }
 
 fn audit_context(auth: &AuthContext, reason: Option<String>) -> AuditContext {

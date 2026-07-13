@@ -1,21 +1,22 @@
-﻿use std::collections::HashMap;
+use std::collections::HashMap;
 use std::error::Error;
 use std::sync::Arc;
 use std::time::Duration;
 
 use pipe_bolt_api::dto::{
-    ForwarderCountersResponse, ProjectConfigDocumentV1, RuntimeCountersResponse,
-    RuntimeLifecycleState, RuntimePipelineCountersResponse, RuntimeReloadResponse,
+    CommandExecutionStatusResponse, ExecuteCommandResponse, ForwarderCountersResponse,
+    ProjectConfigDocumentV1, ReadinessStatus, RuntimeCountersResponse, RuntimeLifecycleState,
+    RuntimePipelineCountersResponse, RuntimeReadinessResponse, RuntimeReloadResponse,
     RuntimeStatusResponse,
 };
 use pipe_bolt_api::{
-    ApiState, ManagementAuth, ManagementStorage, RuntimeControl, RuntimeControlError,
-    management_router,
+    ApiState, ManagementAuth, ManagementProjectScope, ManagementRole, ManagementStorage,
+    RuntimeControl, RuntimeControlError, management_router,
 };
 use pipe_bolt_domain::{
-    BackpressurePolicy, BrokerConnectionConfig, BrokerId, DeviceIdExtraction, MqttCredentials,
-    MqttQos, PayloadCodecKind, ProjectConfig, ProjectId, ReconnectPolicy, SecretString, TlsMode,
-    TopicFilter, TopicRouteConfig,
+    BackpressurePolicy, BrokerConnectionConfig, BrokerId, CommandExecutionId, CommandTemplateId,
+    DeviceIdExtraction, MqttCredentials, MqttQos, NormalizedEvent, PayloadCodecKind, ProjectConfig,
+    ProjectId, ReconnectPolicy, SecretString, TlsMode, TopicFilter, TopicRouteConfig, UserId,
 };
 use pipe_bolt_storage::error::StorageError;
 use pipe_bolt_storage::model::{
@@ -28,11 +29,11 @@ use salvo::prelude::*;
 use salvo::test::{ResponseExt, TestClient};
 use serde_json::{Value, json};
 use time::OffsetDateTime;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, broadcast};
 
 type TestResult<T = ()> = Result<T, Box<dyn Error + Send + Sync>>;
 
-const TEST_TOKEN: &str = "test-management-token";
+const TEST_TOKEN: &str = "test-management-token-0123456789abcdef";
 const TEST_PROJECT_ID: &str = "project-test";
 
 #[tokio::test]
@@ -78,6 +79,78 @@ async fn management_config_rejects_invalid_token() -> TestResult {
         .await;
 
     assert_eq!(response.status_code, Some(StatusCode::UNAUTHORIZED));
+    Ok(())
+}
+
+#[tokio::test]
+async fn management_readyz_is_public_and_reports_ready() -> TestResult {
+    let service = test_service(
+        TestStorage::with_config(runtime_supported_config(1)?),
+        TestRuntime::default(),
+    )?;
+
+    let response = TestClient::get("http://127.0.0.1:8080/readyz")
+        .send(&service)
+        .await;
+
+    assert_eq!(response.status_code, Some(StatusCode::OK));
+    Ok(())
+}
+
+#[tokio::test]
+async fn realtime_sse_requires_bearer_token() -> TestResult {
+    let service = test_service(
+        TestStorage::with_config(runtime_supported_config(1)?),
+        TestRuntime::default(),
+    )?;
+
+    let response = TestClient::get("http://127.0.0.1:8080/projects/project-test/realtime/sse")
+        .send(&service)
+        .await;
+
+    assert_eq!(response.status_code, Some(StatusCode::UNAUTHORIZED));
+    Ok(())
+}
+
+#[tokio::test]
+async fn management_write_rejects_viewer_role() -> TestResult {
+    let service = test_service_with_auth(
+        TestStorage::with_config(runtime_supported_config(1)?),
+        TestRuntime::default(),
+        viewer_auth()?,
+    )?;
+    let body = update_body(1, runtime_supported_config(1)?, Some("viewer update"))?;
+
+    let response = TestClient::put("http://127.0.0.1:8080/projects/project-test/config")
+        .bearer_auth(TEST_TOKEN)
+        .json(&body)
+        .send(&service)
+        .await;
+
+    assert_eq!(response.status_code, Some(StatusCode::FORBIDDEN));
+    Ok(())
+}
+
+#[tokio::test]
+async fn management_read_rejects_disallowed_project_scope() -> TestResult {
+    let auth = ManagementAuth::bearer_with_context(
+        TEST_TOKEN,
+        UserId::new("user:scoped")?,
+        ManagementRole::Admin,
+        ManagementProjectScope::projects(vec![ProjectId::new("project-allowed")?]),
+    )?;
+    let service = test_service_with_auth(
+        TestStorage::with_config(runtime_supported_config(1)?),
+        TestRuntime::default(),
+        auth,
+    )?;
+
+    let response = TestClient::get("http://127.0.0.1:8080/projects/project-test/config")
+        .bearer_auth(TEST_TOKEN)
+        .send(&service)
+        .await;
+
+    assert_eq!(response.status_code, Some(StatusCode::FORBIDDEN));
     Ok(())
 }
 
@@ -335,6 +408,58 @@ async fn runtime_reload_audits_success_and_failure() -> TestResult {
 }
 
 #[tokio::test]
+async fn command_execute_requires_operator_permission() -> TestResult {
+    let service = test_service_with_auth(
+        TestStorage::with_config(runtime_supported_config(1)?),
+        TestRuntime::default(),
+        viewer_auth()?,
+    )?;
+
+    let response = TestClient::post(
+        "http://127.0.0.1:8080/projects/project-test/commands/command-main/execute",
+    )
+    .bearer_auth(TEST_TOKEN)
+    .json(&json!({ "params": { "device_id": "device-1" } }))
+    .send(&service)
+    .await;
+
+    assert_eq!(response.status_code, Some(StatusCode::FORBIDDEN));
+    Ok(())
+}
+
+#[tokio::test]
+async fn command_execute_returns_accepted_when_runtime_queues_command() -> TestResult {
+    let runtime = TestRuntime::default();
+    let service = test_service(
+        TestStorage::with_config(runtime_supported_config(1)?),
+        runtime.clone(),
+    )?;
+
+    let mut response = TestClient::post(
+        "http://127.0.0.1:8080/projects/project-test/commands/command-main/execute",
+    )
+    .bearer_auth(TEST_TOKEN)
+    .json(&json!({
+        "params": { "device_id": "device-1", "state": true },
+        "reason": "test command"
+    }))
+    .send(&service)
+    .await;
+    let body = response.take_json::<Value>().await?;
+
+    assert_eq!(response.status_code, Some(StatusCode::ACCEPTED));
+    assert_eq!(
+        body.pointer("/status").and_then(Value::as_str),
+        Some("queued")
+    );
+    assert_eq!(
+        runtime.execute_audit_reasons().await,
+        vec![Some("test command".to_owned())]
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn list_endpoints_enforce_limit_and_cursor() -> TestResult {
     let storage = TestStorage::with_config(runtime_supported_config(1)?);
     let service = test_service(storage.clone(), TestRuntime::default())?;
@@ -350,6 +475,7 @@ async fn list_endpoints_enforce_limit_and_cursor() -> TestResult {
     Ok(())
 }
 
+#[cfg(feature = "salvo-oapi")]
 #[tokio::test]
 async fn openapi_spec_contains_bearer_scheme() -> TestResult {
     let service = test_service(
@@ -370,16 +496,68 @@ async fn openapi_spec_contains_bearer_scheme() -> TestResult {
     Ok(())
 }
 
+#[cfg(feature = "salvo-oapi")]
+#[tokio::test]
+async fn openapi_spec_contains_phase9_endpoints() -> TestResult {
+    let service = test_service(
+        TestStorage::with_config(runtime_supported_config(1)?),
+        TestRuntime::default(),
+    )?;
+
+    let mut response = TestClient::get("http://127.0.0.1:8080/api-doc/openapi.json")
+        .send(&service)
+        .await;
+    let body = response.take_json::<Value>().await?;
+
+    assert!(
+        body.pointer("/paths/~1readyz/get")
+            .is_some_and(Value::is_object)
+    );
+    Ok(())
+}
+
+#[cfg(feature = "salvo-oapi")]
+#[tokio::test]
+async fn openapi_spec_contains_unified_realtime_sse_endpoint() -> TestResult {
+    let service = test_service(
+        TestStorage::with_config(runtime_supported_config(1)?),
+        TestRuntime::default(),
+    )?;
+
+    let mut response = TestClient::get("http://127.0.0.1:8080/api-doc/openapi.json")
+        .send(&service)
+        .await;
+    let body = response.take_json::<Value>().await?;
+
+    assert!(
+        body.pointer("/paths/~1projects~1{project_id}~1realtime~1sse/get")
+            .is_some_and(Value::is_object)
+    );
+    Ok(())
+}
+
 fn test_service(storage: TestStorage, runtime: TestRuntime) -> TestResult<Service> {
+    test_service_with_auth(storage, runtime, ManagementAuth::bearer(TEST_TOKEN)?)
+}
+
+fn test_service_with_auth(
+    storage: TestStorage,
+    runtime: TestRuntime,
+    auth: ManagementAuth,
+) -> TestResult<Service> {
     let storage: Arc<dyn ManagementStorage> = Arc::new(storage);
     let runtime: Arc<dyn RuntimeControl> = Arc::new(runtime);
-    let state = ApiState::new(
-        storage,
-        runtime,
-        ManagementAuth::bearer(TEST_TOKEN)?,
-        1024 * 1024,
-    );
+    let state = ApiState::new(storage, runtime, auth, 1024 * 1024);
     Ok(Service::new(management_router(state)))
+}
+
+fn viewer_auth() -> TestResult<ManagementAuth> {
+    Ok(ManagementAuth::bearer_with_context(
+        TEST_TOKEN,
+        UserId::new("user:viewer")?,
+        ManagementRole::Viewer,
+        ManagementProjectScope::all(),
+    )?)
 }
 
 fn runtime_supported_config(version: u64) -> TestResult<ProjectConfig> {
@@ -536,6 +714,10 @@ struct FailureState {
 
 #[async_trait]
 impl ManagementStorage for TestStorage {
+    async fn health_check(&self) -> Result<(), StorageError> {
+        Ok(())
+    }
+
     async fn load_project_config(
         &self,
         project_id: &ProjectId,
@@ -666,6 +848,16 @@ impl TestRuntime {
             .map(|audit| audit.reason.clone())
             .collect()
     }
+
+    async fn execute_audit_reasons(&self) -> Vec<Option<String>> {
+        self.inner
+            .lock()
+            .await
+            .execute_audits
+            .iter()
+            .map(|audit| audit.reason.clone())
+            .collect()
+    }
 }
 
 #[derive(Default)]
@@ -673,6 +865,7 @@ struct TestRuntimeState {
     validate_mode: ValidateMode,
     reload_mode: ReloadMode,
     reload_audits: Vec<AuditContext>,
+    execute_audits: Vec<AuditContext>,
 }
 
 #[derive(Default)]
@@ -694,6 +887,16 @@ enum ReloadMode {
 
 #[async_trait]
 impl RuntimeControl for TestRuntime {
+    async fn readiness(&self) -> Result<RuntimeReadinessResponse, RuntimeControlError> {
+        Ok(RuntimeReadinessResponse {
+            status: ReadinessStatus::Ready,
+            project_id: TEST_PROJECT_ID.to_owned(),
+            lifecycle: RuntimeLifecycleState::Running,
+            active_version: Some(1),
+            message: None,
+        })
+    }
+
     async fn status(
         &self,
         project_id: &ProjectId,
@@ -711,6 +914,14 @@ impl RuntimeControl for TestRuntime {
                 persistence_writer: None,
             },
         })
+    }
+
+    async fn subscribe_realtime_events(
+        &self,
+        _project_id: &ProjectId,
+    ) -> Result<broadcast::Receiver<NormalizedEvent>, RuntimeControlError> {
+        let (_tx, rx) = broadcast::channel(16);
+        Ok(rx)
     }
 
     async fn validate_candidate_config(
@@ -756,5 +967,30 @@ impl RuntimeControl for TestRuntime {
                 reason: "runtime start failed".to_owned(),
             }),
         }
+    }
+
+    async fn execute_command(
+        &self,
+        project_id: &ProjectId,
+        command_template_id: &CommandTemplateId,
+        _params: std::collections::BTreeMap<String, serde_json::Value>,
+        audit: AuditContext,
+    ) -> Result<ExecuteCommandResponse, RuntimeControlError> {
+        self.inner.lock().await.execute_audits.push(audit);
+
+        Ok(ExecuteCommandResponse {
+            project_id: project_id.clone(),
+            command_template_id: command_template_id.clone(),
+            command_execution_id: CommandExecutionId::new("command-exec-test")
+                .expect("command execution id"),
+            status: CommandExecutionStatusResponse::Queued,
+            broker_id: BrokerId::new("broker-main").expect("broker id"),
+            topic: "devices/device-1/command".to_owned(),
+            qos: MqttQos::AtLeastOnce,
+            retain: false,
+            payload_size_bytes: 14,
+            queued_at: OffsetDateTime::now_utc(),
+            audit_event_id: "audit-test".to_owned(),
+        })
     }
 }

@@ -15,3 +15,9 @@ rustflags = [
 
 [build]
 incremental = true
+
+[alias]
+dev = "run -p pipe-bolt-daemon --features dev"
+dev-check = "check --workspace --features dev"
+dev-test  = "test --workspace --features dev"
+deploy = "build --profile deployment"
