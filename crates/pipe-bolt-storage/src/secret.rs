@@ -230,7 +230,6 @@ fn validate_key_id(key_id: &str) -> Result<(), StorageError> {
 
 #[cfg(test)]
 mod tests {
-    use base64::Engine as _;
     use base64::engine::general_purpose::STANDARD;
 
     use super::*;

@@ -7,6 +7,7 @@ use pipe_bolt_domain::{
     DecodedPayload, FieldValue, MqttQos, NormalizedEvent, PayloadSchemaMapping, ProjectConfig,
     ProjectId, RuleDefinition, SinkDefinition, TenantId, TopicRouteConfig,
 };
+use pipe_bolt_storage::model::{AuditEventRecord, FailureEventRecord, SinkDeliveryOutcomeRecord};
 #[cfg(feature = "salvo-oapi")]
 use salvo::oapi::ToSchema;
 use serde::{Deserialize, Serialize};
@@ -162,6 +163,172 @@ pub struct ListResponse<T> {
     pub items: Vec<T>,
     #[serde(with = "time::serde::rfc3339::option")]
     pub next_before: Option<OffsetDateTime>,
+    pub limit: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[cfg_attr(feature = "salvo-oapi", derive(ToSchema))]
+pub struct AuditEventResponse {
+    pub audit_event_id: String,
+    pub project_id: Option<ProjectId>,
+    pub actor_id: Option<String>,
+    pub action: String,
+    pub target_type: String,
+    pub target_id: String,
+    pub status: String,
+    pub reason: Option<String>,
+    pub metadata: serde_json::Map<String, serde_json::Value>,
+    #[serde(with = "time::serde::rfc3339")]
+    pub occurred_at: OffsetDateTime,
+}
+
+impl From<AuditEventRecord> for AuditEventResponse {
+    fn from(record: AuditEventRecord) -> Self {
+        Self {
+            audit_event_id: record.audit_event_id,
+            project_id: record.project_id,
+            actor_id: record.actor_id.map(|actor_id| actor_id.to_string()),
+            action: record.action,
+            target_type: record.target_type,
+            target_id: record.target_id,
+            status: record.status.as_str().to_owned(),
+            reason: record.reason,
+            metadata: record.metadata,
+            occurred_at: record.occurred_at,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[cfg_attr(feature = "salvo-oapi", derive(ToSchema))]
+pub struct AuditEventListResponse {
+    pub items: Vec<AuditEventResponse>,
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub next_before: Option<OffsetDateTime>,
+    pub limit: u32,
+}
+
+impl From<ListResponse<AuditEventResponse>> for AuditEventListResponse {
+    fn from(response: ListResponse<AuditEventResponse>) -> Self {
+        Self {
+            items: response.items,
+            next_before: response.next_before,
+            limit: response.limit,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[cfg_attr(feature = "salvo-oapi", derive(ToSchema))]
+pub struct FailureEventResponse {
+    pub failure_id: String,
+    pub project_id: ProjectId,
+    pub event_id: Option<String>,
+    pub sink_id: Option<String>,
+    pub component: String,
+    pub failure_kind: String,
+    pub severity: String,
+    pub message: String,
+    pub details: serde_json::Map<String, serde_json::Value>,
+    #[serde(with = "time::serde::rfc3339")]
+    pub occurred_at: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub resolved_at: Option<OffsetDateTime>,
+    pub resolution: Option<String>,
+}
+
+impl From<FailureEventRecord> for FailureEventResponse {
+    fn from(record: FailureEventRecord) -> Self {
+        Self {
+            failure_id: record.failure_id,
+            project_id: record.project_id,
+            event_id: record.event_id.map(|event_id| event_id.to_string()),
+            sink_id: record.sink_id.map(|sink_id| sink_id.to_string()),
+            component: record.component,
+            failure_kind: record.failure_kind,
+            severity: record.severity.as_str().to_owned(),
+            message: record.message,
+            details: record.details,
+            occurred_at: record.occurred_at,
+            resolved_at: record.resolved_at,
+            resolution: record.resolution,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[cfg_attr(feature = "salvo-oapi", derive(ToSchema))]
+pub struct FailureListResponse {
+    pub items: Vec<FailureEventResponse>,
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub next_before: Option<OffsetDateTime>,
+    pub limit: u32,
+}
+
+impl From<ListResponse<FailureEventResponse>> for FailureListResponse {
+    fn from(response: ListResponse<FailureEventResponse>) -> Self {
+        Self {
+            items: response.items,
+            next_before: response.next_before,
+            limit: response.limit,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[cfg_attr(feature = "salvo-oapi", derive(ToSchema))]
+pub struct SinkDeliveryOutcomeResponse {
+    pub delivery_id: String,
+    pub project_id: ProjectId,
+    pub event_id: String,
+    pub sink_id: String,
+    pub status: String,
+    pub http_status: Option<u16>,
+    pub response_body_bytes: Option<u64>,
+    pub failure_reason: Option<String>,
+    pub correlation_id: Option<String>,
+    pub duration_ms: Option<u64>,
+    pub attempt: u16,
+    #[serde(with = "time::serde::rfc3339")]
+    pub occurred_at: OffsetDateTime,
+}
+
+impl From<SinkDeliveryOutcomeRecord> for SinkDeliveryOutcomeResponse {
+    fn from(record: SinkDeliveryOutcomeRecord) -> Self {
+        Self {
+            delivery_id: record.delivery_id,
+            project_id: record.project_id,
+            event_id: record.event_id.to_string(),
+            sink_id: record.sink_id.to_string(),
+            status: record.status,
+            http_status: record.http_status,
+            response_body_bytes: record.response_body_bytes,
+            failure_reason: record.failure_reason,
+            correlation_id: record.correlation_id,
+            duration_ms: record.duration_ms,
+            attempt: record.attempt,
+            occurred_at: record.occurred_at,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[cfg_attr(feature = "salvo-oapi", derive(ToSchema))]
+pub struct DeliveryOutcomeListResponse {
+    pub items: Vec<SinkDeliveryOutcomeResponse>,
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub next_before: Option<OffsetDateTime>,
+    pub limit: u32,
+}
+
+impl From<ListResponse<SinkDeliveryOutcomeResponse>> for DeliveryOutcomeListResponse {
+    fn from(response: ListResponse<SinkDeliveryOutcomeResponse>) -> Self {
+        Self {
+            items: response.items,
+            next_before: response.next_before,
+            limit: response.limit,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize)]

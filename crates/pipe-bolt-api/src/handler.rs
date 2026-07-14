@@ -10,13 +10,16 @@ use time::format_description::well_known::Rfc3339;
 
 use crate::auth::{AUTH_CONTEXT_KEY, AuthContext, ManagementPermission};
 use crate::dto::{
-    ExecuteCommandRequest, HealthResponse, ListResponse, ProjectConfigResponse,
+    AuditEventListResponse, AuditEventResponse, DeliveryOutcomeListResponse, ExecuteCommandRequest,
+    FailureEventResponse, FailureListResponse, HealthResponse, ListResponse, ProjectConfigResponse,
     ProjectConfigWriteResponse, ReadinessCheckResponse, ReadinessResponse, ResolveFailureRequest,
     ResolveFailureResponse, RuntimeReadinessResponse, RuntimeReloadRequest,
-    UpdateProjectConfigRequest,
+    SinkDeliveryOutcomeResponse, UpdateProjectConfigRequest,
 };
 #[cfg(feature = "salvo-oapi")]
-use crate::dto::{ExecuteCommandResponse, RuntimeReloadResponse, RuntimeStatusResponse};
+use crate::dto::{
+    ErrorResponse, ExecuteCommandResponse, RuntimeReloadResponse, RuntimeStatusResponse,
+};
 use crate::error::{ApiError, write_error_response};
 use crate::state::ApiState;
 
@@ -43,6 +46,16 @@ pub async fn get_health(res: &mut Response) {
             service: MANAGEMENT_SERVICE_NAME.to_owned(),
         },
     );
+}
+
+#[cfg_attr(feature = "salvo-oapi", endpoint(
+    tags("health"),
+    operation_id = "get_healthz",
+    responses((status_code = 200, description = "Management API liveness", body = HealthResponse))
+))]
+#[cfg_attr(not(feature = "salvo-oapi"), handler)]
+pub async fn get_healthz(res: &mut Response) {
+    render_health_response(res);
 }
 
 #[cfg_attr(feature = "salvo-oapi", endpoint(
@@ -111,11 +124,12 @@ pub async fn require_management_auth(
     tags("config"),
     operation_id = "get_project_config",
     security(("bearer_auth" = [])),
+    parameters(("project_id" = String, Path, description = "Project identifier")),
     responses(
         (status_code = 200, description = "Active project configuration", body = ProjectConfigResponse),
-        (status_code = 401, description = "Unauthorized"),
-        (status_code = 403, description = "Forbidden"),
-        (status_code = 404, description = "Project config not found")
+        (status_code = 401, description = "Unauthorized", body = ErrorResponse),
+        (status_code = 403, description = "Forbidden", body = ErrorResponse),
+        (status_code = 404, description = "Project config not found", body = ErrorResponse)
     )
 ))]
 #[cfg_attr(not(feature = "salvo-oapi"), handler)]
@@ -130,11 +144,16 @@ pub async fn get_project_config(req: &mut Request, depot: &mut Depot, res: &mut 
     tags("config"),
     operation_id = "put_project_config",
     security(("bearer_auth" = [])),
+    parameters(("project_id" = String, Path, description = "Project identifier")),
+    request_body = UpdateProjectConfigRequest,
     responses(
         (status_code = 200, description = "Configuration successfully updated", body = ProjectConfigWriteResponse),
-        (status_code = 400, description = "Invalid request or version mismatch"),
-        (status_code = 401, description = "Unauthorized"),
-        (status_code = 403, description = "Forbidden")
+        (status_code = 400, description = "Invalid request", body = ErrorResponse),
+        (status_code = 401, description = "Unauthorized", body = ErrorResponse),
+        (status_code = 403, description = "Forbidden", body = ErrorResponse),
+        (status_code = 409, description = "Version conflict", body = ErrorResponse),
+        (status_code = 413, description = "Request body too large", body = ErrorResponse),
+        (status_code = 422, description = "Invalid project config", body = ErrorResponse)
     )
 ))]
 #[cfg_attr(not(feature = "salvo-oapi"), handler)]
@@ -149,9 +168,16 @@ pub async fn put_project_config(req: &mut Request, depot: &mut Depot, res: &mut 
     tags("audit"),
     operation_id = "get_audit_events",
     security(("bearer_auth" = [])),
+    parameters(
+        ("project_id" = String, Path, description = "Project identifier"),
+        ("limit" = Option<u32>, Query, description = "Maximum records to return"),
+        ("before" = Option<String>, Query, description = "RFC3339 cursor; returns records before this timestamp")
+    ),
     responses(
-        (status_code = 200, description = "List of audit event records"),
-        (status_code = 401, description = "Unauthorized")
+        (status_code = 200, description = "List of audit event records", body = AuditEventListResponse),
+        (status_code = 400, description = "Invalid query", body = ErrorResponse),
+        (status_code = 401, description = "Unauthorized", body = ErrorResponse),
+        (status_code = 403, description = "Forbidden", body = ErrorResponse)
     )
 ))]
 #[cfg_attr(not(feature = "salvo-oapi"), handler)]
@@ -166,8 +192,17 @@ pub async fn get_audit_events(req: &mut Request, depot: &mut Depot, res: &mut Re
     tags("failure"),
     operation_id = "get_failures",
     security(("bearer_auth" = [])),
+    parameters(
+        ("project_id" = String, Path, description = "Project identifier"),
+        ("limit" = Option<u32>, Query, description = "Maximum records to return"),
+        ("before" = Option<String>, Query, description = "RFC3339 cursor; returns records before this timestamp"),
+        ("unresolved_only" = Option<bool>, Query, description = "Return only unresolved failures")
+    ),
     responses(
-        (status_code = 200, description = "List of ingestion/processing failures")
+        (status_code = 200, description = "List of ingestion/processing failures", body = FailureListResponse),
+        (status_code = 400, description = "Invalid query", body = ErrorResponse),
+        (status_code = 401, description = "Unauthorized", body = ErrorResponse),
+        (status_code = 403, description = "Forbidden", body = ErrorResponse)
     )
 ))]
 #[cfg_attr(not(feature = "salvo-oapi"), handler)]
@@ -182,10 +217,18 @@ pub async fn get_failures(req: &mut Request, depot: &mut Depot, res: &mut Respon
     tags("failure"),
     operation_id = "resolve_failure",
     security(("bearer_auth" = [])),
+    parameters(
+        ("project_id" = String, Path, description = "Project identifier"),
+        ("failure_id" = String, Path, description = "Failure identifier")
+    ),
+    request_body = ResolveFailureRequest,
     responses(
         (status_code = 200, description = "Failure resolved", body = ResolveFailureResponse),
-        (status_code = 404, description = "Failure event not found"),
-        (status_code = 409, description = "Failure already resolved")
+        (status_code = 400, description = "Invalid resolution request", body = ErrorResponse),
+        (status_code = 401, description = "Unauthorized", body = ErrorResponse),
+        (status_code = 403, description = "Forbidden", body = ErrorResponse),
+        (status_code = 404, description = "Failure event not found", body = ErrorResponse),
+        (status_code = 409, description = "Failure already resolved", body = ErrorResponse)
     )
 ))]
 #[cfg_attr(not(feature = "salvo-oapi"), handler)]
@@ -200,8 +243,16 @@ pub async fn resolve_failure(req: &mut Request, depot: &mut Depot, res: &mut Res
     tags("etl"),
     operation_id = "get_delivery_outcomes",
     security(("bearer_auth" = [])),
+    parameters(
+        ("project_id" = String, Path, description = "Project identifier"),
+        ("limit" = Option<u32>, Query, description = "Maximum records to return"),
+        ("before" = Option<String>, Query, description = "RFC3339 cursor; returns records before this timestamp")
+    ),
     responses(
-        (status_code = 200, description = "List of sink delivery outcome records")
+        (status_code = 200, description = "List of sink delivery outcome records", body = DeliveryOutcomeListResponse),
+        (status_code = 400, description = "Invalid query", body = ErrorResponse),
+        (status_code = 401, description = "Unauthorized", body = ErrorResponse),
+        (status_code = 403, description = "Forbidden", body = ErrorResponse)
     )
 ))]
 #[cfg_attr(not(feature = "salvo-oapi"), handler)]
@@ -216,8 +267,13 @@ pub async fn get_delivery_outcomes(req: &mut Request, depot: &mut Depot, res: &m
     tags("runtime"),
     operation_id = "get_runtime_status",
     security(("bearer_auth" = [])),
+    parameters(("project_id" = String, Path, description = "Project identifier")),
     responses(
-        (status_code = 200, description = "Active runtime metrics and connection statuses", body = RuntimeStatusResponse)
+        (status_code = 200, description = "Active runtime metrics and connection statuses", body = RuntimeStatusResponse),
+        (status_code = 401, description = "Unauthorized", body = ErrorResponse),
+        (status_code = 403, description = "Forbidden", body = ErrorResponse),
+        (status_code = 404, description = "Runtime not found", body = ErrorResponse),
+        (status_code = 503, description = "Runtime unavailable", body = ErrorResponse)
     )
 ))]
 #[cfg_attr(not(feature = "salvo-oapi"), handler)]
@@ -232,10 +288,20 @@ pub async fn get_runtime_status(req: &mut Request, depot: &mut Depot, res: &mut 
     tags("command"),
     operation_id = "post_execute_command",
     security(("bearer_auth" = [])),
+    parameters(
+        ("project_id" = String, Path, description = "Project identifier"),
+        ("command_template_id" = String, Path, description = "Command template identifier")
+    ),
+    request_body = Option<ExecuteCommandRequest>,
     responses(
         (status_code = 202, description = "Command execution queued", body = ExecuteCommandResponse),
-        (status_code = 400, description = "Invalid execution parameters"),
-        (status_code = 404, description = "Command template not found")
+        (status_code = 400, description = "Invalid execution parameters", body = ErrorResponse),
+        (status_code = 401, description = "Unauthorized", body = ErrorResponse),
+        (status_code = 403, description = "Forbidden", body = ErrorResponse),
+        (status_code = 404, description = "Command template not found", body = ErrorResponse),
+        (status_code = 413, description = "Request body too large", body = ErrorResponse),
+        (status_code = 422, description = "Command rejected", body = ErrorResponse),
+        (status_code = 503, description = "Runtime unavailable", body = ErrorResponse)
     )
 ))]
 #[cfg_attr(not(feature = "salvo-oapi"), handler)]
@@ -250,8 +316,17 @@ pub async fn post_execute_command(req: &mut Request, depot: &mut Depot, res: &mu
     tags("runtime"),
     operation_id = "post_runtime_reload",
     security(("bearer_auth" = [])),
+    parameters(("project_id" = String, Path, description = "Project identifier")),
+    request_body = Option<RuntimeReloadRequest>,
     responses(
-        (status_code = 200, description = "Runtime configuration successfully reloaded", body = RuntimeReloadResponse)
+        (status_code = 200, description = "Runtime configuration successfully reloaded", body = RuntimeReloadResponse),
+        (status_code = 401, description = "Unauthorized", body = ErrorResponse),
+        (status_code = 403, description = "Forbidden", body = ErrorResponse),
+        (status_code = 404, description = "Runtime not found", body = ErrorResponse),
+        (status_code = 409, description = "Reload already in progress", body = ErrorResponse),
+        (status_code = 413, description = "Request body too large", body = ErrorResponse),
+        (status_code = 422, description = "Invalid runtime config", body = ErrorResponse),
+        (status_code = 503, description = "Runtime unavailable", body = ErrorResponse)
     )
 ))]
 #[cfg_attr(not(feature = "salvo-oapi"), handler)]
@@ -260,6 +335,17 @@ pub async fn post_runtime_reload(req: &mut Request, depot: &mut Depot, res: &mut
         Ok(response) => render_json(res, StatusCode::OK, &response),
         Err(error) => render_error(res, error),
     }
+}
+
+fn render_health_response(res: &mut Response) {
+    render_json(
+        res,
+        StatusCode::OK,
+        &HealthResponse {
+            status: "ok".to_owned(),
+            service: MANAGEMENT_SERVICE_NAME.to_owned(),
+        },
+    );
 }
 
 async fn readiness_inner(depot: &Depot) -> Result<ReadinessResponse, ApiError> {
@@ -365,7 +451,7 @@ async fn put_project_config_inner(
 async fn get_audit_events_inner(
     req: &mut Request,
     depot: &mut Depot,
-) -> Result<ListResponse<pipe_bolt_storage::model::AuditEventRecord>, ApiError> {
+) -> Result<AuditEventListResponse, ApiError> {
     let state = authorized_state(depot)?;
     let project_id = path_project_id(req)?;
     authorize_project(depot, &project_id, ManagementPermission::ProjectRead)?;
@@ -375,14 +461,20 @@ async fn get_audit_events_inner(
         .list_audit_events(&project_id, query)
         .await?;
     let next_before = items.last().map(|item| item.occurred_at);
+    let items = items.into_iter().map(AuditEventResponse::from).collect();
 
-    Ok(ListResponse { items, next_before })
+    Ok(ListResponse {
+        items,
+        next_before,
+        limit: query.limit,
+    }
+    .into())
 }
 
 async fn get_failures_inner(
     req: &mut Request,
     depot: &mut Depot,
-) -> Result<ListResponse<pipe_bolt_storage::model::FailureEventRecord>, ApiError> {
+) -> Result<FailureListResponse, ApiError> {
     let state = authorized_state(depot)?;
     let project_id = path_project_id(req)?;
     authorize_project(depot, &project_id, ManagementPermission::ProjectRead)?;
@@ -395,8 +487,14 @@ async fn get_failures_inner(
     };
     let items = state.storage().list_failures(&project_id, query).await?;
     let next_before = items.last().map(|item| item.occurred_at);
+    let items = items.into_iter().map(FailureEventResponse::from).collect();
 
-    Ok(ListResponse { items, next_before })
+    Ok(ListResponse {
+        items,
+        next_before,
+        limit: query.limit,
+    }
+    .into())
 }
 
 async fn resolve_failure_inner(
@@ -433,7 +531,7 @@ async fn resolve_failure_inner(
 async fn get_delivery_outcomes_inner(
     req: &mut Request,
     depot: &mut Depot,
-) -> Result<ListResponse<pipe_bolt_storage::model::SinkDeliveryOutcomeRecord>, ApiError> {
+) -> Result<DeliveryOutcomeListResponse, ApiError> {
     let state = authorized_state(depot)?;
     let project_id = path_project_id(req)?;
     authorize_project(depot, &project_id, ManagementPermission::ProjectRead)?;
@@ -443,8 +541,17 @@ async fn get_delivery_outcomes_inner(
         .list_delivery_outcomes(&project_id, query)
         .await?;
     let next_before = items.last().map(|item| item.occurred_at);
+    let items = items
+        .into_iter()
+        .map(SinkDeliveryOutcomeResponse::from)
+        .collect();
 
-    Ok(ListResponse { items, next_before })
+    Ok(ListResponse {
+        items,
+        next_before,
+        limit: query.limit,
+    }
+    .into())
 }
 
 async fn get_runtime_status_inner(

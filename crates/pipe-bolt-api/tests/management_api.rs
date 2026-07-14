@@ -536,6 +536,82 @@ async fn openapi_spec_contains_unified_realtime_sse_endpoint() -> TestResult {
     Ok(())
 }
 
+#[cfg(feature = "salvo-oapi")]
+#[tokio::test]
+async fn openapi_spec_should_use_unique_health_operation_ids() -> TestResult {
+    let body = openapi_json().await?;
+
+    assert_eq!(
+        body.pointer("/paths/~1healthz/get/operationId")
+            .and_then(Value::as_str),
+        Some("get_healthz"),
+    );
+    Ok(())
+}
+
+#[cfg(feature = "salvo-oapi")]
+#[tokio::test]
+async fn openapi_spec_should_document_project_path_parameter() -> TestResult {
+    let body = openapi_json().await?;
+
+    assert!(
+        body.pointer("/paths/~1projects~1{project_id}~1config/get/parameters")
+            .and_then(Value::as_array)
+            .is_some_and(|parameters| parameters.iter().any(|parameter| {
+                parameter.get("name").and_then(Value::as_str) == Some("project_id")
+                    && parameter.get("in").and_then(Value::as_str) == Some("path")
+            }))
+    );
+    Ok(())
+}
+
+#[cfg(feature = "salvo-oapi")]
+#[tokio::test]
+async fn openapi_spec_should_document_config_write_body() -> TestResult {
+    let body = openapi_json().await?;
+
+    assert!(body
+        .pointer("/paths/~1projects~1{project_id}~1config/put/requestBody/content/application~1json/schema")
+        .is_some());
+    Ok(())
+}
+
+#[cfg(feature = "salvo-oapi")]
+#[tokio::test]
+async fn openapi_spec_should_document_command_execute_body() -> TestResult {
+    let body = openapi_json().await?;
+
+    assert!(body
+        .pointer("/paths/~1projects~1{project_id}~1commands~1{command_template_id}~1execute/post/requestBody/content/application~1json/schema")
+        .is_some());
+    Ok(())
+}
+
+#[cfg(feature = "salvo-oapi")]
+#[tokio::test]
+async fn openapi_spec_should_document_audit_list_response_schema() -> TestResult {
+    let body = openapi_json().await?;
+
+    assert!(body
+        .pointer("/paths/~1projects~1{project_id}~1audit-events/get/responses/200/content/application~1json/schema")
+        .is_some());
+    Ok(())
+}
+
+#[cfg(feature = "salvo-oapi")]
+async fn openapi_json() -> TestResult<Value> {
+    let service = test_service(
+        TestStorage::with_config(runtime_supported_config(1)?),
+        TestRuntime::default(),
+    )?;
+
+    let mut response = TestClient::get("http://127.0.0.1:8080/api-doc/openapi.json")
+        .send(&service)
+        .await;
+
+    Ok(response.take_json::<Value>().await?)
+}
+
 fn test_service(storage: TestStorage, runtime: TestRuntime) -> TestResult<Service> {
     test_service_with_auth(storage, runtime, ManagementAuth::bearer(TEST_TOKEN)?)
 }

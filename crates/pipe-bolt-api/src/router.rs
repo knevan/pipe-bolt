@@ -5,9 +5,9 @@ use salvo::prelude::*;
 use tokio::sync::watch;
 
 use crate::handler::{
-    get_audit_events, get_delivery_outcomes, get_failures, get_health, get_project_config,
-    get_readyz, get_runtime_status, post_execute_command, post_runtime_reload, put_project_config,
-    require_management_auth, resolve_failure,
+    get_audit_events, get_delivery_outcomes, get_failures, get_health, get_healthz,
+    get_project_config, get_readyz, get_runtime_status, post_execute_command, post_runtime_reload,
+    put_project_config, require_management_auth, resolve_failure,
 };
 #[cfg(feature = "salvo-oapi")]
 use crate::openapi::attach_openapi;
@@ -38,7 +38,7 @@ pub fn management_router(state: ApiState) -> Router {
     let router = Router::new()
         .hoop(affix_state::inject(state))
         .push(Router::with_path("health").get(get_health))
-        .push(Router::with_path("healthz").get(get_health))
+        .push(Router::with_path("healthz").get(get_healthz))
         .push(Router::with_path("readyz").get(get_readyz))
         .push(
             Router::with_path("projects/{project_id}")

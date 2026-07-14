@@ -13,6 +13,8 @@ use tokio::sync::{broadcast, mpsc, watch};
 use tokio::time::{MissedTickBehavior, interval, timeout};
 
 use crate::auth::{AUTH_CONTEXT_KEY, AuthContext, ManagementPermission};
+#[cfg(feature = "salvo-oapi")]
+use crate::dto::ErrorResponse;
 use crate::dto::{
     RealtimeClientMessage, RealtimeEventResponse, RealtimeFilterSnapshot, RealtimeServerMessage,
 };
@@ -103,11 +105,20 @@ struct RealtimeSubscription {
     tags("realtime"),
     operation_id = "project_realtime_sse",
     security(("bearer_auth" = [])),
+    parameters(
+        ("project_id" = String, Path, description = "Project identifier"),
+        ("device_id" = Option<String>, Query, description = "Optional device ID filter"),
+        ("topic" = Option<String>, Query, description = "Optional exact topic filter"),
+        ("topic_prefix" = Option<String>, Query, description = "Optional topic prefix filter"),
+        ("event_type" = Option<String>, Query, description = "Optional event type filter"),
+        ("route_id" = Option<String>, Query, description = "Optional route ID filter")
+    ),
     responses(
-        (status_code = 200, description = "Server-Sent Events stream of normalized events"),
-        (status_code = 401, description = "Unauthorized"),
-        (status_code = 403, description = "Forbidden"),
-        (status_code = 503, description = "Runtime unavailable")
+        (status_code = 200, description = "Server-Sent Events stream of normalized events", body = RealtimeServerMessage),
+        (status_code = 400, description = "Invalid realtime filter", body = ErrorResponse),
+        (status_code = 401, description = "Unauthorized", body = ErrorResponse),
+        (status_code = 403, description = "Forbidden", body = ErrorResponse),
+        (status_code = 503, description = "Runtime unavailable", body = ErrorResponse)
     )
 ))]
 #[cfg_attr(not(feature = "salvo-oapi"), handler)]
@@ -169,12 +180,20 @@ pub async fn realtime_sse(req: &mut Request, depot: &mut Depot, res: &mut Respon
     tags("realtime"),
     operation_id = "project_realtime_ws",
     security(("bearer_auth" = [])),
+    parameters(
+        ("project_id" = String, Path, description = "Project identifier"),
+        ("device_id" = Option<String>, Query, description = "Optional device ID filter"),
+        ("topic" = Option<String>, Query, description = "Optional exact topic filter"),
+        ("topic_prefix" = Option<String>, Query, description = "Optional topic prefix filter"),
+        ("event_type" = Option<String>, Query, description = "Optional event type filter"),
+        ("route_id" = Option<String>, Query, description = "Optional route ID filter")
+    ),
     responses(
         (status_code = 101, description = "WebSocket upgrade accepted"),
-        (status_code = 400, description = "Invalid WebSocket upgrade or filter"),
-        (status_code = 401, description = "Unauthorized"),
-        (status_code = 403, description = "Forbidden"),
-        (status_code = 503, description = "Runtime unavailable")
+        (status_code = 400, description = "Invalid WebSocket upgrade or filter", body = ErrorResponse),
+        (status_code = 401, description = "Unauthorized", body = ErrorResponse),
+        (status_code = 403, description = "Forbidden", body = ErrorResponse),
+        (status_code = 503, description = "Runtime unavailable", body = ErrorResponse)
     )
 ))]
 #[cfg_attr(not(feature = "salvo-oapi"), handler)]
