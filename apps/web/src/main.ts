@@ -1,22 +1,22 @@
-import { createApp } from "vue";
-import { createPinia } from "pinia";
-import { PiniaColada } from "@pinia/colada";
+import { createApp } from 'vue'
+import { createPinia } from 'pinia'
+import { PiniaColada } from '@pinia/colada'
 
-import App from "./App.vue";
-import { createAppRouter } from "./app/router";
-import { initializeApiClient } from "./api/client";
-import { useAuthStore } from "./auth";
-import "./app/styles.css";
+import App from './App.vue'
+import { createAppRouter } from './app/router'
+import { initializeApiClient } from './api/client'
+import { useAuthStore } from './auth'
+import './app/styles.css'
 
-const app = createApp(App);
-const pinia = createPinia();
-const router = createAppRouter(pinia);
-const auth = useAuthStore(pinia);
+const app = createApp(App)
+const pinia = createPinia()
+const router = createAppRouter(pinia)
+const auth = useAuthStore(pinia)
 
-initializeApiClient({ getAccessToken: () => auth.accessToken });
+initializeApiClient({ getAccessToken: () => auth.accessToken })
 
-app.use(pinia);
-app.use(PiniaColada);
-app.use(router);
+app.use(pinia)
+app.use(PiniaColada)
+app.use(router)
 
-app.mount("#app");
+app.mount('#app')

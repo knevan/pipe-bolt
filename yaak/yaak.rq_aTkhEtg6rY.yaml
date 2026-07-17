@@ -2,7 +2,7 @@ type: http_request
 model: http_request
 id: rq_aTkhEtg6rY
 createdAt: 2026-06-24T18:45:25.972415900
-updatedAt: 2026-06-24T19:00:49.026898900
+updatedAt: 2026-07-17T02:27:18.668991100
 workspaceId: wk_RswPFWqsc9
 folderId: fl_38jkvEMWeo
 authentication: {}
@@ -29,7 +29,7 @@ headers:
   name: Content-Type
   value: application/json
   id: erV7dMPqvu
-method: POST
+method: GET
 name: Failures
 sortPriority: 4000.0
 url: http://127.0.0.1:8081/projects/project-dev-1/failures

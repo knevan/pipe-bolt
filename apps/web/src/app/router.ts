@@ -3,8 +3,11 @@ import type { Pinia } from 'pinia'
 
 import AppShell from './AppShell.vue'
 import { authRoutes, createAuthGuard } from '@/auth'
-import { projectRoutes } from '@/projects'
+import { configRoutes } from '@/config'
+import { createProjectRoutes } from '@/projects'
 import { runtimeRoutes } from '@/runtime'
+
+const projectRoutes = createProjectRoutes(configRoutes)
 
 const protectedRoutes: RouteRecordRaw[] = [
   {

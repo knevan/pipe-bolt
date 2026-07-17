@@ -1,2 +1,2 @@
 export { useProjectStore } from './project.store'
-export { projectRoutes } from './projects.routes'
+export { createProjectRoutes } from './projects.routes'

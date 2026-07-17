@@ -1,16 +1,16 @@
 type: folder
 model: folder
-id: fl_38jkvEMWeo
-createdAt: 2026-06-24T18:31:57.177111800
-updatedAt: 2026-07-17T02:20:14.586093600
+id: fl_Ld5EMBELko
+createdAt: 2026-07-17T02:20:11.523165500
+updatedAt: 2026-07-17T02:20:14.599807400
 workspaceId: wk_RswPFWqsc9
 folderId: null
 authentication: {}
 authenticationType: null
 description: ''
 headers: []
-name: pipe-bolt-api
-sortPriority: 0.0
+name: test payload
+sortPriority: 1000.0
 settingSendCookies:
   enabled: false
   value: true

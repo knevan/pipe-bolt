@@ -1,37 +1,28 @@
 type: http_request
 model: http_request
-id: rq_5zPhXhkEZs
-createdAt: 2026-06-24T18:49:59.949052600
-updatedAt: 2026-07-17T02:38:49.285237
+id: rq_y79pWsodc9
+createdAt: 2026-07-17T02:40:20.959197200
+updatedAt: 2026-07-17T02:41:31.031834100
 workspaceId: wk_RswPFWqsc9
 folderId: fl_38jkvEMWeo
 authentication: {}
 authenticationType: null
-body:
-  sendJsonComments: true
-  text: |-
-    // {
-    //   "reason": "Apply updated MQTT topic filter configuration"
-    // }
-bodyType: application/json
+body: {}
+bodyType: null
 description: ''
 headers:
 - enabled: true
   name: Authorization
   value: Bearer dev_secret_management_token_2026
-  id: KZiJ9fAqTi
+  id: Yzw3ye6BHn
 - enabled: true
   name: ''
   value: ''
-  id: 7QgKpBkZUZ
-- enabled: true
-  name: Content-Type
-  value: application/json
-  id: YsSnZa6zY9
-method: POST
-name: Runtime Reload
-sortPriority: 2333.3333333333335
-url: http://127.0.0.1:8081/projects/project-dev-1/runtime/reload
+  id: i4vEmDfs4C
+method: GET
+name: Open SSE Connection
+sortPriority: 2703.703703703704
+url: http://127.0.0.1:8081/projects/project-dev-1/realtime/sse
 urlParameters: []
 settingSendCookies:
   enabled: false

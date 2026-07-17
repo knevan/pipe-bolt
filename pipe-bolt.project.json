@@ -39,8 +39,23 @@
       "backpressure": "reject"
     }
   ],
+  "rules": [
+    {
+      "id": "rule-stream-telemetry",
+      "name": "Stream Telemetry to UI",
+      "enabled": true,
+      "trigger": {
+        "type": "event_received"
+      },
+      "condition": null,
+      "actions": [
+        {
+          "type": "stream_to_ui"
+        }
+      ]
+    }
+  ],
   "schema_mappings": [],
-  "rules": [],
   "command_templates": [],
   "sinks": []
 }

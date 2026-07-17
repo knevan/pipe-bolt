@@ -1,0 +1,7 @@
+{
+  "deviceId": "esp32-01",
+  "timestamp": "2026-07-17T15:30:21Z",
+  "temperature": 26.8,
+  "humidity": 58.2,
+  "status": "active"
+}
