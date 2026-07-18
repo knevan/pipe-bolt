@@ -84,6 +84,24 @@ async function logout(): Promise<void> {
           </svg>
           Configuration
         </RouterLink>
+        <RouterLink
+          v-if="activeProjectId"
+          :to="{ name: 'project-realtime', params: { projectId: activeProjectId } }"
+        >
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M4 12h3l2-5 3 10 3-7 2 2h3" />
+          </svg>
+          Realtime events
+        </RouterLink>
+        <RouterLink
+          v-if="activeProjectId"
+          :to="{ name: 'project-commands', params: { projectId: activeProjectId } }"
+        >
+          <svg viewBox="0 0 24 24" aria-hidden="true">
+            <path d="M5 12h10M12 7l5 5-5 5M5 7v10" />
+          </svg>
+          Commands
+        </RouterLink>
 
         <p class="nav-label nav-label-spaced">DIAGNOSE</p>
         <RouterLink :to="{ name: 'runtime-status' }">

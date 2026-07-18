@@ -81,12 +81,12 @@ const isRefreshing = computed(
     </div>
 
     <div v-if="system.readiness.data.value" class="subsystem-grid">
-      <article class="panel subsystem-card">
+      <article v-if="system.readiness.data.value.storage" class="panel subsystem-card">
         <div class="subsystem-title">
           <span
             class="status-dot"
             :class="
-              system.readiness.data.value.storage.status === 'ready'
+              system.readiness.data.value.storage?.status === 'ready'
                 ? 'status-dot-safe'
                 : 'status-dot-danger'
             "
@@ -102,12 +102,12 @@ const isRefreshing = computed(
         </p>
       </article>
 
-      <article class="panel subsystem-card">
+      <article v-if="system.readiness.data.value.runtime" class="panel subsystem-card">
         <div class="subsystem-title">
           <span
             class="status-dot"
             :class="
-              system.readiness.data.value.runtime.status === 'ready'
+              system.readiness.data.value.runtime?.status === 'ready'
                 ? 'status-dot-safe'
                 : 'status-dot-danger'
             "
