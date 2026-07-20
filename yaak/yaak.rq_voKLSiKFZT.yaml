@@ -2,13 +2,14 @@ type: http_request
 model: http_request
 id: rq_voKLSiKFZT
 createdAt: 2026-06-24T18:34:07.527530300
-updatedAt: 2026-06-24T19:37:27.002520900
+updatedAt: 2026-07-18T09:50:47.389771900
 workspaceId: wk_RswPFWqsc9
 folderId: fl_38jkvEMWeo
 authentication: {}
 authenticationType: null
-body: {}
-bodyType: null
+body:
+  text: ''
+bodyType: application/json
 description: ''
 headers:
 - enabled: true
@@ -18,12 +19,20 @@ headers:
 - enabled: true
   name: ''
   value: ''
-  id: fqmMxMAsrK
+  id: NXmSgdAqF6
+- enabled: true
+  name: Content-Type
+  value: application/json
+  id: duDubwrM23
 method: GET
 name: Project Config
 sortPriority: 1000.0
 url: http://127.0.0.1:8081/projects/project-dev-1/config
-urlParameters: []
+urlParameters:
+- enabled: true
+  name: ''
+  value: ''
+  id: VkJdNzgJ2E
 settingSendCookies:
   enabled: false
   value: true

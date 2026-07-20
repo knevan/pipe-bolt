@@ -2,7 +2,7 @@ type: http_request
 model: http_request
 id: rq_RbwKdqvqiM
 createdAt: 2026-06-24T18:41:05.190458600
-updatedAt: 2026-07-17T02:24:37.474377700
+updatedAt: 2026-07-18T09:51:17.873685500
 workspaceId: wk_RswPFWqsc9
 folderId: fl_38jkvEMWeo
 authentication: {}
@@ -10,10 +10,10 @@ authenticationType: null
 body:
   text: |
     {
-      "expected_version": 2,
+      "expected_version": 6,
       "reason": "Updating local configuration for test",
       "config": {
-        "id": "project-dev-1",
+        "project_id": "project-dev-1",
         "name": "Local Development Project",
         "description": "Project configuration for local development",
         "enabled": true,
@@ -53,8 +53,23 @@ body:
             "backpressure": "reject"
           }
         ],
+        "rules": [
+          {
+            "id": "rule-stream-telemetry",
+            "name": "Stream Telemetry to UI",
+            "enabled": true,
+            "trigger": {
+              "type": "event_received"
+            },
+            "condition": null,
+            "actions": [
+              {
+                "type": "stream_to_ui"
+              }
+            ]
+          }
+        ],
         "schema_mappings": [],
-        "rules": [],
         "command_templates": [],
         "sinks": []
       }

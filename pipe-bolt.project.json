@@ -8,7 +8,7 @@
     {
       "id": "broker-local",
       "name": "Local MQTT Broker",
-      "host": "localhost",
+      "host": "127.0.0.1",
       "port": 1883,
       "tls": "disabled",
       "keep_alive": 30,
@@ -31,7 +31,7 @@
       "schema_mapping_id": null,
       "device_id": {
         "type": "topic_wildcard_index",
-        "index": 1
+        "index": 0
       },
       "event_type": "telemetry",
       "qos": "at_most_once",

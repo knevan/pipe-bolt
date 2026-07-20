@@ -1,0 +1,16 @@
+[settings]
+auto_install = false
+
+[tasks.rust]
+description = "Run Rust backend"
+dir = "."
+run = "cargo dev"
+
+[tasks.vue]
+description = "Run Vue frontend"
+dir = "apps/web"
+run = "pnpm dev"
+
+[tasks.dev]
+description = "Run all services"
+depends = ["rust", "vue"]
