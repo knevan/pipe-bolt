@@ -5,11 +5,19 @@ import AppShell from './AppShell.vue'
 import { authRoutes, createAuthGuard } from '@/auth'
 import { commandRoutes } from '@/commands'
 import { configRoutes } from '@/config'
+import { operationRoutes } from '@/operations'
 import { createProjectRoutes } from '@/projects'
 import { realtimeRoutes } from '@/realtime'
+import { ruleRoutes } from '@/rules'
 import { runtimeRoutes } from '@/runtime'
 
-const projectRoutes = createProjectRoutes([...configRoutes, ...realtimeRoutes, ...commandRoutes])
+const projectRoutes = createProjectRoutes([
+  ...configRoutes,
+  ...realtimeRoutes,
+  ...commandRoutes,
+  ...ruleRoutes,
+  ...operationRoutes,
+])
 
 const protectedRoutes: RouteRecordRaw[] = [
   {
