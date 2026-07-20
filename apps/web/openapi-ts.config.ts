@@ -1,31 +1,31 @@
-import { defineConfig } from "@hey-api/openapi-ts";
+import { defineConfig } from '@hey-api/openapi-ts'
 
 export default defineConfig({
-  input: "./open-api.json",
+  input: './open-api.json',
   output: {
-    path: "src/api/generated",
+    path: 'src/api/generated',
     fileName: {
-      case: "preserve",
+      case: 'preserve',
     },
-    tsConfigPath: "./tsconfig.json",
-    postProcess: ["oxlint", "oxfmt"],
+    tsConfigPath: './tsconfig.json',
+    postProcess: ['oxlint', 'oxfmt'],
   },
   plugins: [
     {
-      name: "@hey-api/client-ky",
+      name: '@hey-api/client-ky',
     },
     {
-      name: "@pinia/colada",
+      name: '@pinia/colada',
       queryOptions: true,
       mutationOptions: true,
       queryKeys: true,
     },
     {
-      name: "valibot",
+      name: 'valibot',
       requests: true,
       responses: true,
       definitions: true,
       metadata: true,
     },
   ],
-});
+})

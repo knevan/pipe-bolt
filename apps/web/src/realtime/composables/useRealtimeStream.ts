@@ -4,7 +4,6 @@ import {
   onUnmounted,
   shallowRef,
   toValue,
-  triggerRef,
   watch,
   type MaybeRefOrGetter,
 } from 'vue'
@@ -13,11 +12,10 @@ import { createParser } from 'eventsource-parser'
 import { ApiError, getApiErrorMessage } from '@/api/errors'
 import { useAuthStore } from '@/auth'
 import { openRealtimeStream } from '../realtime.api'
+import { RealtimeEventBuffer } from '../realtime.buffer'
 import type { RealtimeConnectionState, RealtimeEvent, RealtimeFilters } from '../realtime.types'
 import { parseRealtimeMessage, RealtimeProtocolError } from '../realtime.validation'
 
-const MAX_EVENTS = 200
-const MAX_BUFFER_WEIGHT = 16 * 1024 * 1024
 const MAX_SSE_FRAME_CHARS = 1024 * 1024
 const INITIAL_RETRY_MS = 1_000
 const MAX_RETRY_MS = 30_000
@@ -69,9 +67,8 @@ function streamErrorMessage(error: unknown): string {
 
 export function useRealtimeStream({ filters, projectId }: UseRealtimeStreamOptions) {
   const auth = useAuthStore()
-  const eventBuffer: RealtimeEvent[] = []
-  const eventWeights: number[] = []
-  const events = shallowRef<ReadonlyArray<RealtimeEvent>>(eventBuffer)
+  const eventBuffer = new RealtimeEventBuffer()
+  const events = shallowRef<ReadonlyArray<RealtimeEvent>>([])
   const connectionState = shallowRef<RealtimeConnectionState>('idle')
   const errorMessage = shallowRef<string>()
   const streamNotice = shallowRef<string>()
@@ -89,7 +86,6 @@ export function useRealtimeStream({ filters, projectId }: UseRealtimeStreamOptio
   let animationFrame: number | undefined
   let watchdog: number | undefined
   let lastActivityMs = 0
-  let bufferWeight = 0
 
   const isConnected = computed(() => connectionState.value === 'connected')
   const isPaused = computed(() => desiredState.value === 'paused')
@@ -97,7 +93,7 @@ export function useRealtimeStream({ filters, projectId }: UseRealtimeStreamOptio
 
   function flushEvents(): void {
     animationFrame = undefined
-    triggerRef(events)
+    events.value = [...eventBuffer.events]
     lastEventAt.value = Date.now()
   }
 
@@ -106,31 +102,27 @@ export function useRealtimeStream({ filters, projectId }: UseRealtimeStreamOptio
     animationFrame = window.requestAnimationFrame(flushEvents)
   }
 
+  function flushScheduledEvents(): void {
+    if (animationFrame === undefined) return
+    window.cancelAnimationFrame(animationFrame)
+    flushEvents()
+  }
+
   function markLag(message: string): void {
     lagMessage.value = message
     lagVisible.value = true
   }
 
   function pushEvent(event: RealtimeEvent, frameLength: number): void {
-    const weight = Math.max(1, frameLength * 2)
-    let dropped = 0
-    if (!Number.isSafeInteger(weight) || weight > MAX_BUFFER_WEIGHT) {
-      dropped = 1
-    } else {
-      while (eventBuffer.length >= MAX_EVENTS || bufferWeight + weight > MAX_BUFFER_WEIGHT) {
-        eventBuffer.shift()
-        bufferWeight -= eventWeights.shift() ?? 0
-        dropped++
-      }
-      eventBuffer.push(event)
-      eventWeights.push(weight)
-      bufferWeight += weight
-    }
-    if (dropped > 0) {
-      browserDropped.value = Math.min(Number.MAX_SAFE_INTEGER, browserDropped.value + dropped)
+    const result = eventBuffer.push(event, frameLength)
+    if (result.dropped > 0) {
+      browserDropped.value = Math.min(
+        Number.MAX_SAFE_INTEGER,
+        browserDropped.value + result.dropped,
+      )
       markLag('Browser buffer overflowed; oldest events were discarded.')
     }
-    if (weight <= MAX_BUFFER_WEIGHT) scheduleFlush()
+    if (result.accepted) scheduleFlush()
   }
 
   function handleMessage(
@@ -346,8 +338,7 @@ export function useRealtimeStream({ filters, projectId }: UseRealtimeStreamOptio
     desiredState.value = 'paused'
     sessionGeneration++
     sessionController?.abort()
-    if (animationFrame !== undefined) window.cancelAnimationFrame(animationFrame)
-    animationFrame = undefined
+    flushScheduledEvents()
     connectionState.value = 'paused'
   }
 
@@ -360,8 +351,7 @@ export function useRealtimeStream({ filters, projectId }: UseRealtimeStreamOptio
     desiredState.value = 'stopped'
     sessionGeneration++
     sessionController?.abort()
-    if (animationFrame !== undefined) window.cancelAnimationFrame(animationFrame)
-    animationFrame = undefined
+    flushScheduledEvents()
     connectionState.value = 'idle'
     reconnectAttempt.value = 0
     errorMessage.value = undefined
@@ -369,12 +359,10 @@ export function useRealtimeStream({ filters, projectId }: UseRealtimeStreamOptio
   }
 
   function clearEvents(): void {
-    eventBuffer.length = 0
-    eventWeights.length = 0
-    bufferWeight = 0
+    eventBuffer.clear()
     if (animationFrame !== undefined) window.cancelAnimationFrame(animationFrame)
     animationFrame = undefined
-    triggerRef(events)
+    events.value = []
     backendSkipped.value = 0
     browserDropped.value = 0
     lagVisible.value = false

@@ -57,7 +57,12 @@ function toggleCredentials(index: number, enabled: boolean): void {
     </div>
 
     <p v-if="!modelValue.length" class="config-empty">No brokers configured.</p>
-    <article v-for="(broker, index) in modelValue" :key="broker.id" class="config-item">
+    <article
+      v-for="(broker, index) in modelValue"
+      :key="broker.id"
+      class="config-item"
+      :aria-label="`Broker ${index + 1}: ${broker.name || 'Unnamed broker'}`"
+    >
       <div class="config-item-heading">
         <div>
           <span class="config-index">{{ index + 1 }}</span
