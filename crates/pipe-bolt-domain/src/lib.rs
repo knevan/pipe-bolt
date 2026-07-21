@@ -13,6 +13,7 @@
 )]
 
 pub mod action;
+pub mod command;
 pub mod config;
 pub mod error;
 pub mod event;
@@ -20,6 +21,7 @@ pub mod id;
 pub mod rule;
 
 pub use action::*;
+pub use command::*;
 pub use config::*;
 pub use error::*;
 pub use event::*;

@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use pipe_bolt_core::command::{CommandRenderError, CommandTemplateRenderer};
 use pipe_bolt_core::config::{MqttClientConfig, MqttReconnectConfig, MqttTlsMode};
 use pipe_bolt_core::dispatcher::action::{
     ActionDispatcher, DispatchLimits, RealtimeEventSink, RealtimePublishReceipt,
@@ -22,9 +23,9 @@ use pipe_bolt_core::pipeline::router::ConfigRouteMatcher;
 use pipe_bolt_core::router::matcher::MqttRouter;
 use pipe_bolt_core::rule::rules::{RuleEngine, RuleEngineLimits};
 use pipe_bolt_domain::{
-    ActionIntentTemplate, BackpressurePolicy, BrokerConnectionConfig, BrokerId, CommandTemplate,
-    CommandTemplateId, MqttQos, NormalizedEvent, PayloadSchemaMapping, ProjectConfig, ProjectId,
-    SinkKind, TlsMode, TopicName, TopicRouteConfig,
+    ActionIntentTemplate, BackpressurePolicy, BrokerConnectionConfig, BrokerId, CommandTemplateId,
+    MqttQos, NormalizedEvent, PayloadSchemaMapping, ProjectConfig, ProjectId, SinkKind, TlsMode,
+    TopicRouteConfig,
 };
 use pipe_bolt_storage::postgres::PostgresStorage;
 use rumqttc::QoS;
@@ -40,7 +41,6 @@ use crate::persistence_writer::{
 
 const DEFAULT_REALTIME_EVENT_CAPACITY: usize = 1024;
 const DEFAULT_WORKER_JOIN_TIMEOUT: Duration = Duration::from_secs(10);
-const MAX_COMMAND_PAYLOAD_BYTES: usize = 64 * 1024;
 
 type RuntimeDispatcher = ActionDispatcher<RuntimeRealtimeSink, BoundedHttpForwarder>;
 
@@ -449,7 +449,9 @@ impl ProjectRuntime {
             });
         }
 
-        let rendered = render_command_template(template, params)?;
+        let rendered = CommandTemplateRenderer::default()
+            .render_draft(template, params)
+            .map_err(command_render_error_to_runtime)?;
         let engine = self
             .mqtt_engines
             .iter()
@@ -458,8 +460,9 @@ impl ProjectRuntime {
                 broker_id: template.broker_id.to_string(),
             })?;
 
+        let topic = rendered.topic.as_str().to_owned();
         engine.engine.handle().try_enqueue_command(
-            rendered.topic.clone(),
+            topic.clone(),
             map_qos(template.qos),
             template.retain,
             rendered.payload,
@@ -468,7 +471,7 @@ impl ProjectRuntime {
         Ok(QueuedRuntimeCommand {
             command_template_id: template.id.clone(),
             broker_id: template.broker_id.clone(),
-            topic: rendered.topic,
+            topic,
             qos: template.qos,
             retain: template.retain,
             payload_size_bytes: rendered.payload_size_bytes,
@@ -757,203 +760,14 @@ fn qos_rank(qos: QoS) -> u8 {
     }
 }
 
-struct RenderedRuntimeCommand {
-    topic: String,
-    payload: Vec<u8>,
-    payload_size_bytes: u64,
-}
-
-fn render_command_template(
-    template: &CommandTemplate,
-    params: &BTreeMap<String, serde_json::Value>,
-) -> Result<RenderedRuntimeCommand, RuntimeError> {
-    let topic = render_topic_template(template, params)?;
-    TopicName::new(topic.as_str()).map_err(|error| RuntimeError::CommandTemplateRender {
-        template_id: template.id.to_string(),
-        reason: error.to_string(),
-    })?;
-
-    let payload_value = render_payload_value(template, &template.payload_template, params)?;
-    let payload = serde_json::to_vec(&payload_value).map_err(|error| {
-        RuntimeError::CommandTemplateRender {
-            template_id: template.id.to_string(),
-            reason: error.to_string(),
-        }
-    })?;
-    if payload.len() > MAX_COMMAND_PAYLOAD_BYTES {
-        return Err(RuntimeError::CommandPayloadTooLarge {
-            max: MAX_COMMAND_PAYLOAD_BYTES,
-            actual: payload.len(),
-        });
+fn command_render_error_to_runtime(error: CommandRenderError) -> RuntimeError {
+    if let CommandRenderError::PayloadTooLarge { max, actual, .. } = error {
+        return RuntimeError::CommandPayloadTooLarge { max, actual };
     }
 
-    Ok(RenderedRuntimeCommand {
-        topic,
-        payload_size_bytes: saturating_usize_to_u64(payload.len()),
-        payload,
-    })
-}
-
-fn render_topic_template(
-    template: &CommandTemplate,
-    params: &BTreeMap<String, serde_json::Value>,
-) -> Result<String, RuntimeError> {
-    let mut output = String::with_capacity(template.topic_template.len());
-    let mut rest = template.topic_template.as_str();
-
-    while let Some(start) = rest.find('{') {
-        output.push_str(&rest[..start]);
-        let after_start = &rest[start + 1..];
-        let Some(end) = after_start.find('}') else {
-            return Err(template_render_error(
-                template,
-                "unclosed topic placeholder",
-            ));
-        };
-        let key = &after_start[..end];
-        output.push_str(&topic_param(template, key, params)?);
-        rest = &after_start[end + 1..];
-    }
-    output.push_str(rest);
-
-    if output.contains('}') {
-        return Err(template_render_error(
-            template,
-            "unopened topic placeholder",
-        ));
-    }
-
-    Ok(output)
-}
-
-fn render_payload_value(
-    template: &CommandTemplate,
-    value: &serde_json::Value,
-    params: &BTreeMap<String, serde_json::Value>,
-) -> Result<serde_json::Value, RuntimeError> {
-    match value {
-        serde_json::Value::String(text) => render_payload_string(template, text, params),
-        serde_json::Value::Array(values) => values
-            .iter()
-            .map(|value| render_payload_value(template, value, params))
-            .collect::<Result<Vec<_>, _>>()
-            .map(serde_json::Value::Array),
-        serde_json::Value::Object(object) => object
-            .iter()
-            .map(|(key, value)| Ok((key.clone(), render_payload_value(template, value, params)?)))
-            .collect::<Result<serde_json::Map<_, _>, RuntimeError>>()
-            .map(serde_json::Value::Object),
-        _ => Ok(value.clone()),
-    }
-}
-
-fn render_payload_string(
-    template: &CommandTemplate,
-    text: &str,
-    params: &BTreeMap<String, serde_json::Value>,
-) -> Result<serde_json::Value, RuntimeError> {
-    if let Some(key) = exact_placeholder_key(text) {
-        return params
-            .get(key)
-            .cloned()
-            .ok_or_else(|| template_render_error(template, &format!("missing parameter '{key}'")));
-    }
-
-    render_embedded_placeholders(template, text, params).map(serde_json::Value::String)
-}
-
-fn render_embedded_placeholders(
-    template: &CommandTemplate,
-    text: &str,
-    params: &BTreeMap<String, serde_json::Value>,
-) -> Result<String, RuntimeError> {
-    let mut output = String::with_capacity(text.len());
-    let mut rest = text;
-
-    while let Some(start) = rest.find('{') {
-        output.push_str(&rest[..start]);
-        let after_start = &rest[start + 1..];
-        let Some(end) = after_start.find('}') else {
-            return Err(template_render_error(
-                template,
-                "unclosed payload placeholder",
-            ));
-        };
-        let key = &after_start[..end];
-        output.push_str(&scalar_param(template, key, params)?);
-        rest = &after_start[end + 1..];
-    }
-    output.push_str(rest);
-
-    if output.contains('}') {
-        return Err(template_render_error(
-            template,
-            "unopened payload placeholder",
-        ));
-    }
-
-    Ok(output)
-}
-
-fn exact_placeholder_key(text: &str) -> Option<&str> {
-    text.strip_prefix('{')?.strip_suffix('}')
-}
-
-fn topic_param(
-    template: &CommandTemplate,
-    key: &str,
-    params: &BTreeMap<String, serde_json::Value>,
-) -> Result<String, RuntimeError> {
-    let value = scalar_param(template, key, params)?;
-    if value.is_empty()
-        || value.contains('/')
-        || value.contains('+')
-        || value.contains('#')
-        || value.contains('\0')
-        || value.chars().any(char::is_control)
-    {
-        return Err(template_render_error(
-            template,
-            &format!("parameter '{key}' must be a single MQTT topic segment"),
-        ));
-    }
-
-    Ok(value)
-}
-
-fn scalar_param(
-    template: &CommandTemplate,
-    key: &str,
-    params: &BTreeMap<String, serde_json::Value>,
-) -> Result<String, RuntimeError> {
-    if key.trim().is_empty() {
-        return Err(template_render_error(
-            template,
-            "placeholder name must not be empty",
-        ));
-    }
-
-    let value = params
-        .get(key)
-        .ok_or_else(|| template_render_error(template, &format!("missing parameter '{key}'")))?;
-
-    match value {
-        serde_json::Value::String(value) => Ok(value.clone()),
-        serde_json::Value::Number(value) => Ok(value.to_string()),
-        serde_json::Value::Bool(value) => Ok(value.to_string()),
-        serde_json::Value::Null | serde_json::Value::Array(_) | serde_json::Value::Object(_) => {
-            Err(template_render_error(
-                template,
-                &format!("parameter '{key}' must be scalar"),
-            ))
-        }
-    }
-}
-
-fn template_render_error(template: &CommandTemplate, reason: &str) -> RuntimeError {
     RuntimeError::CommandTemplateRender {
-        template_id: template.id.to_string(),
-        reason: reason.to_owned(),
+        template_id: error.template_id().to_string(),
+        reason: error.to_string(),
     }
 }
 
@@ -1288,7 +1102,6 @@ fn saturating_usize_to_u64(value: usize) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
     use std::time::Duration;
 
     use pipe_bolt_domain::{
@@ -1404,26 +1217,6 @@ mod tests {
             error,
             RuntimeError::CommandTemplateReferencesUnavailableBroker { .. }
         ));
-    }
-
-    #[test]
-    fn command_template_should_preserve_json_type_when_payload_is_exact_placeholder() {
-        let template = command_template("command-1");
-        let params = BTreeMap::from([("state".to_owned(), serde_json::json!(true))]);
-
-        let rendered = render_payload_string(&template, "{state}", &params).expect("rendered");
-
-        assert_eq!(rendered, serde_json::json!(true));
-    }
-
-    #[test]
-    fn command_template_should_reject_topic_segment_escape() {
-        let template = command_template("command-1");
-        let params = BTreeMap::from([("device_id".to_owned(), serde_json::json!("a/b"))]);
-
-        let error = render_topic_template(&template, &params).expect_err("segment escape");
-
-        assert!(matches!(error, RuntimeError::CommandTemplateRender { .. }));
     }
 
     #[tokio::test]
