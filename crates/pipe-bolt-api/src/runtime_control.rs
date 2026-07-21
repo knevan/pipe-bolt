@@ -74,6 +74,12 @@ pub enum RuntimeControlError {
     #[error("command rejected: {reason}")]
     CommandRejected { reason: String },
 
+    #[error("command queue is full")]
+    CommandQueueFull,
+
+    #[error("command queue unavailable: {reason}")]
+    CommandQueueUnavailable { reason: String },
+
     #[error("storage error: {reason}")]
     Storage { reason: String },
 }

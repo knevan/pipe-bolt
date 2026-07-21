@@ -160,6 +160,15 @@ pub enum DispatchError {
 
     #[error("forward payload is too large: {actual} exceeds {max} bytes")]
     ForwardPayloadTooLarge { actual: usize, max: usize },
+
+    #[error("command queue is unavailable")]
+    CommandQueueUnavailable,
+
+    #[error("command queue is full")]
+    CommandQueueBackpressure,
+
+    #[error("command execution request could not be built: {reason}")]
+    CommandRequestBuild { reason: &'static str },
 }
 
 #[derive(Debug, Error, Clone, Eq, PartialEq)]

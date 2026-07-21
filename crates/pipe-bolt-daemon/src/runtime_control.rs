@@ -9,7 +9,11 @@ use pipe_bolt_api::dto::{
     RuntimeReloadResponse, RuntimeStatusResponse,
 };
 use pipe_bolt_api::{RuntimeControl, RuntimeControlError};
-use pipe_bolt_domain::{CommandTemplateId, NormalizedEvent, ProjectConfig, ProjectId};
+use pipe_bolt_core::command::{CommandRenderContext, CommandRenderError, CommandTemplateRenderer};
+use pipe_bolt_domain::{
+    CommandExecutionId, CommandExecutionRequest, CommandSource, CommandTemplate, CommandTemplateId,
+    NormalizedEvent, ProjectConfig, ProjectId, RenderedCommand,
+};
 use pipe_bolt_storage::model::{
     AuditContext, AuditStatus, CommandExecutionStatus, NewAuditEvent, NewCommandExecution,
 };
@@ -17,8 +21,11 @@ use pipe_bolt_storage::postgres::PostgresStorage;
 use serde_json::json;
 use time::OffsetDateTime;
 use tokio::sync::{Mutex, broadcast};
+use uuid::Uuid;
 
-use crate::runtime::{ProjectRuntime, RuntimePersistence, RuntimeSettings};
+use crate::runtime::{
+    ProjectRuntime, RuntimeCommandQueueError, RuntimePersistence, RuntimeSettings,
+};
 
 pub struct RuntimeSupervisor {
     project_id: ProjectId,
@@ -408,7 +415,7 @@ impl RuntimeControl for RuntimeSupervisor {
         self.ensure_project(project_id)?;
         self.ensure_not_stopping().await?;
 
-        let queued = {
+        let (template, command_queue) = {
             let state = self.state.lock().await;
             let slot =
                 state
@@ -418,30 +425,84 @@ impl RuntimeControl for RuntimeSupervisor {
                         reason: "runtime is not running".to_owned(),
                     })?;
 
-            slot.runtime
-                .execute_command(&slot.config, command_template_id, &params)
-                .map_err(runtime_command_error_to_control)?
+            let template = slot
+                .config
+                .command_templates
+                .iter()
+                .find(|template| &template.id == command_template_id)
+                .ok_or_else(|| RuntimeControlError::CommandTemplateNotFound {
+                    command_template_id: command_template_id.to_string(),
+                })?;
+
+            if !template.enabled {
+                return Err(RuntimeControlError::CommandTemplateNotFound {
+                    command_template_id: command_template_id.to_string(),
+                });
+            }
+
+            (template.clone(), slot.runtime.command_queue_handle())
         };
+
+        let command_execution_id = new_command_execution_id()?;
+        let correlation_id = command_execution_id.as_str().to_owned();
+        let rendered = render_command_preview(
+            project_id,
+            &command_execution_id,
+            &correlation_id,
+            &template,
+            &params,
+        )?;
 
         let record = self
             .storage
             .record_command_execution(NewCommandExecution {
+                command_execution_id: command_execution_id.clone(),
                 project_id: project_id.clone(),
-                command_template_id: queued.command_template_id,
-                broker_id: queued.broker_id,
-                actor_id: audit.actor_id,
+                command_template_id: template.id.clone(),
+                broker_id: rendered.broker_id().clone(),
+                actor_id: audit.actor_id.clone(),
                 status: CommandExecutionStatus::Queued,
-                topic: queued.topic,
-                qos: queued.qos,
-                retain: queued.retain,
-                payload_size_bytes: queued.payload_size_bytes,
+                topic: rendered.topic().as_str().to_owned(),
+                qos: rendered.qos(),
+                retain: rendered.retain(),
+                payload_size_bytes: rendered.payload_size_bytes(),
                 failure_reason: None,
-                reason: audit.reason,
+                reason: audit.reason.clone(),
             })
             .await
             .map_err(|error| RuntimeControlError::Storage {
                 reason: error.to_string(),
             })?;
+
+        let request = CommandExecutionRequest {
+            project_id: project_id.clone(),
+            command_execution_id: command_execution_id.clone(),
+            command_template_id: template.id.clone(),
+            params,
+            source: CommandSource::Api,
+            actor_id: audit.actor_id,
+            source_event_id: None,
+            correlation_id,
+            reason: audit.reason,
+        };
+
+        if let Err(error) = command_queue.try_enqueue(request) {
+            let reason = error.to_string();
+            if let Err(storage_error) = self
+                .storage
+                .mark_command_execution_failed(&command_execution_id, &reason)
+                .await
+            {
+                tracing::warn!(
+                    project_id = %project_id,
+                    command_execution_id = %command_execution_id,
+                    error = %storage_error,
+                    "failed to mark command execution failed after enqueue rejection"
+                );
+            }
+
+            return Err(command_queue_error_to_control(error));
+        }
 
         Ok(ExecuteCommandResponse {
             project_id: record.project_id,
@@ -535,34 +596,54 @@ fn counters_from_runtime(runtime: &ProjectRuntime) -> RuntimeCountersResponse {
     }
 }
 
-fn runtime_command_error_to_control(error: crate::runtime::RuntimeError) -> RuntimeControlError {
+fn new_command_execution_id() -> Result<CommandExecutionId, RuntimeControlError> {
+    CommandExecutionId::new(format!("command_exec_{}", Uuid::now_v7())).map_err(|error| {
+        RuntimeControlError::CommandRejected {
+            reason: error.to_string(),
+        }
+    })
+}
+
+fn render_command_preview(
+    project_id: &ProjectId,
+    command_execution_id: &CommandExecutionId,
+    correlation_id: &str,
+    template: &CommandTemplate,
+    params: &BTreeMap<String, serde_json::Value>,
+) -> Result<RenderedCommand, RuntimeControlError> {
+    CommandTemplateRenderer::default()
+        .render(
+            CommandRenderContext {
+                project_id: project_id.clone(),
+                command_execution_id: command_execution_id.clone(),
+                correlation_id: correlation_id.to_owned(),
+            },
+            template,
+            params,
+        )
+        .map_err(command_render_error_to_control)
+}
+
+fn command_render_error_to_control(error: CommandRenderError) -> RuntimeControlError {
     match error {
-        crate::runtime::RuntimeError::CommandTemplateNotFound { template_id }
-        | crate::runtime::RuntimeError::CommandTemplateDisabled { template_id } => {
-            RuntimeControlError::CommandTemplateNotFound {
-                command_template_id: template_id,
-            }
-        }
-        crate::runtime::RuntimeError::Mqtt(source) => RuntimeControlError::RuntimeUnavailable {
-            reason: source.to_string(),
-        },
-        crate::runtime::RuntimeError::CommandBrokerUnavailable { broker_id } => {
-            RuntimeControlError::RuntimeUnavailable {
-                reason: format!("broker '{broker_id}' is not running"),
-            }
-        }
-        crate::runtime::RuntimeError::CommandTemplateRender { reason, .. } => {
-            RuntimeControlError::CommandRejected { reason }
-        }
-        crate::runtime::RuntimeError::CommandPayloadTooLarge { max, actual } => {
+        CommandRenderError::PayloadTooLarge { max, actual, .. } => {
             RuntimeControlError::CommandRejected {
                 reason: format!(
                     "command payload is too large: max {max} bytes, got {actual} bytes"
                 ),
             }
         }
-        other => RuntimeControlError::RuntimeUnavailable {
+        other => RuntimeControlError::CommandRejected {
             reason: other.to_string(),
+        },
+    }
+}
+
+fn command_queue_error_to_control(error: RuntimeCommandQueueError) -> RuntimeControlError {
+    match error {
+        RuntimeCommandQueueError::Full => RuntimeControlError::CommandQueueFull,
+        RuntimeCommandQueueError::Closed => RuntimeControlError::CommandQueueUnavailable {
+            reason: "command queue is closed".to_owned(),
         },
     }
 }

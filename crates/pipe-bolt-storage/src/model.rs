@@ -157,6 +157,7 @@ impl CommandExecutionStatus {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct NewCommandExecution {
+    pub command_execution_id: CommandExecutionId,
     pub project_id: ProjectId,
     pub command_template_id: CommandTemplateId,
     pub broker_id: BrokerId,

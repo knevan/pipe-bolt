@@ -40,6 +40,9 @@ pub enum ApiError {
         max_bytes: usize,
     },
 
+    #[error("too many requests: {message}")]
+    TooManyRequests { message: String },
+
     #[error("service unavailable: {message}")]
     ServiceUnavailable { message: String },
 
@@ -57,6 +60,7 @@ impl ApiError {
             Self::Conflict { .. } => StatusCode::CONFLICT,
             Self::UnprocessableEntity { .. } => StatusCode::UNPROCESSABLE_ENTITY,
             Self::PayloadTooLarge { .. } => StatusCode::PAYLOAD_TOO_LARGE,
+            Self::TooManyRequests { .. } => StatusCode::TOO_MANY_REQUESTS,
             Self::ServiceUnavailable { .. } => StatusCode::SERVICE_UNAVAILABLE,
             Self::Internal { .. } => StatusCode::INTERNAL_SERVER_ERROR,
         }
@@ -81,6 +85,7 @@ impl ApiError {
             Self::Conflict { .. } => "conflict",
             Self::UnprocessableEntity { .. } => "unprocessable_entity",
             Self::PayloadTooLarge { .. } => "payload_too_large",
+            Self::TooManyRequests { .. } => "too_many_requests",
             Self::ServiceUnavailable { .. } => "service_unavailable",
             Self::Internal { .. } => "internal_server_error",
         }
@@ -94,6 +99,7 @@ impl ApiError {
             | Self::NotFound { message }
             | Self::Conflict { message, .. }
             | Self::UnprocessableEntity { message, .. }
+            | Self::TooManyRequests { message }
             | Self::ServiceUnavailable { message } => message.clone(),
             Self::PayloadTooLarge {
                 actual_bytes,
@@ -245,6 +251,12 @@ impl From<RuntimeControlError> for ApiError {
                 message: reason,
                 details: None,
             },
+            RuntimeControlError::CommandQueueFull => Self::TooManyRequests {
+                message: "command queue is full".to_owned(),
+            },
+            RuntimeControlError::CommandQueueUnavailable { reason } => {
+                Self::ServiceUnavailable { message: reason }
+            }
             RuntimeControlError::UnsafeOldRuntimeShutdown { reason } => {
                 Self::ServiceUnavailable { message: reason }
             }

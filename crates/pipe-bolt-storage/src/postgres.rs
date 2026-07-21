@@ -331,7 +331,6 @@ impl PostgresStorage {
     ) -> Result<CommandExecutionRecord, StorageError> {
         validate_command_execution(&execution)?;
 
-        let command_execution_id = generated_id("command_exec");
         let payload_size_bytes = u64_to_i64("payload_size_bytes", execution.payload_size_bytes)?;
         let actor_id = execution.actor_id.as_ref().map(ToString::to_string);
         let mut tx = self.pool.begin().await?;
@@ -346,7 +345,7 @@ impl PostgresStorage {
             RETURNING occurred_at
             "#,
         )
-        .bind(command_execution_id.as_str())
+        .bind(execution.command_execution_id.as_str())
         .bind(execution.project_id.as_str())
         .bind(execution.command_template_id.as_str())
         .bind(execution.broker_id.as_str())
@@ -363,7 +362,7 @@ impl PostgresStorage {
         let mut metadata = serde_json::Map::new();
         metadata.insert(
             "command_execution_id".to_owned(),
-            json!(command_execution_id),
+            json!(execution.command_execution_id.to_string()),
         );
         metadata.insert(
             "command_template_id".to_owned(),
@@ -401,7 +400,7 @@ impl PostgresStorage {
 
         tx.commit().await?;
         Ok(CommandExecutionRecord {
-            command_execution_id: CommandExecutionId::new(command_execution_id)?,
+            command_execution_id: execution.command_execution_id,
             project_id: execution.project_id,
             command_template_id: execution.command_template_id,
             broker_id: execution.broker_id,
@@ -415,6 +414,28 @@ impl PostgresStorage {
             occurred_at: row.try_get("occurred_at")?,
             audit_event_id,
         })
+    }
+
+    pub async fn mark_command_execution_failed(
+        &self,
+        command_execution_id: &CommandExecutionId,
+        failure_reason: &str,
+    ) -> Result<(), StorageError> {
+        validate_bounded_text("failure_reason", failure_reason, MAX_REASON_BYTES)?;
+
+        sqlx::query(
+            r#"
+            UPDATE command_executions
+            SET status = 'failed', failure_reason = $2
+            WHERE command_execution_id = $1
+            "#,
+        )
+        .bind(command_execution_id.as_str())
+        .bind(failure_reason)
+        .execute(self.pool())
+        .await?;
+
+        Ok(())
     }
 
     pub async fn record_audit_event(&self, event: NewAuditEvent) -> Result<String, StorageError> {

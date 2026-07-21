@@ -8,7 +8,8 @@ use std::time::Duration;
 use pipe_bolt_core::command::{CommandRenderContext, CommandRenderError, CommandTemplateRenderer};
 use pipe_bolt_core::config::{MqttClientConfig, MqttReconnectConfig, MqttTlsMode};
 use pipe_bolt_core::dispatcher::action::{
-    ActionDispatcher, DispatchLimits, RealtimeEventSink, RealtimePublishReceipt,
+    ActionDispatcher, CommandRequestQueue, CommandRequestReceipt, DispatchLimits,
+    RealtimeEventSink, RealtimePublishReceipt,
 };
 use pipe_bolt_core::error::{DispatchError, MqttEngineError};
 use pipe_bolt_core::forwarder::{
@@ -45,7 +46,8 @@ const DEFAULT_REALTIME_EVENT_CAPACITY: usize = 1024;
 const DEFAULT_COMMAND_EXECUTION_CAPACITY: usize = 256;
 const DEFAULT_WORKER_JOIN_TIMEOUT: Duration = Duration::from_secs(10);
 
-type RuntimeDispatcher = ActionDispatcher<RuntimeRealtimeSink, BoundedHttpForwarder>;
+type RuntimeDispatcher =
+    ActionDispatcher<RuntimeRealtimeSink, BoundedHttpForwarder, RuntimeCommandQueueHandle>;
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct RuntimeSettings {
@@ -147,6 +149,18 @@ pub enum RuntimeError {
 
     #[error("enabled rule '{rule_id}' references unsupported sink '{sink_id}'")]
     RuleReferencesUnsupportedSink { rule_id: String, sink_id: String },
+
+    #[error("enabled rule '{rule_id}' references unknown command template '{template_id}'")]
+    RuleReferencesUnknownCommandTemplate {
+        rule_id: String,
+        template_id: String,
+    },
+
+    #[error("enabled rule '{rule_id}' references disabled command template '{template_id}'")]
+    RuleReferencesDisabledCommandTemplate {
+        rule_id: String,
+        template_id: String,
+    },
 
     #[error("domain config error: {0}")]
     Domain(#[from] pipe_bolt_domain::DomainError),
@@ -323,6 +337,26 @@ impl RuntimeCommandQueueHandle {
     }
 }
 
+impl CommandRequestQueue for RuntimeCommandQueueHandle {
+    fn try_enqueue_command(
+        &self,
+        request: CommandExecutionRequest,
+    ) -> Result<CommandRequestReceipt, DispatchError> {
+        let receipt = CommandRequestReceipt {
+            command_execution_id: request.command_execution_id.clone(),
+            command_template_id: request.command_template_id.clone(),
+            accepted: true,
+        };
+
+        self.try_enqueue(request).map_err(|error| match error {
+            RuntimeCommandQueueError::Full => DispatchError::CommandQueueBackpressure,
+            RuntimeCommandQueueError::Closed => DispatchError::CommandQueueUnavailable,
+        })?;
+
+        Ok(receipt)
+    }
+}
+
 #[derive(Clone)]
 pub struct RuntimePersistence {
     project_id: ProjectId,
@@ -378,15 +412,6 @@ pub struct ProjectRuntime {
     realtime_tx: broadcast::Sender<NormalizedEvent>,
     worker_join_timeout: Duration,
     persistence_writer: Option<RuntimePersistenceWriter>,
-}
-
-pub struct QueuedRuntimeCommand {
-    pub command_template_id: CommandTemplateId,
-    pub broker_id: BrokerId,
-    pub topic: String,
-    pub qos: MqttQos,
-    pub retain: bool,
-    pub payload_size_bytes: u64,
 }
 
 struct BrokerRuntime {
@@ -485,8 +510,12 @@ impl ProjectRuntime {
         let forwarder_stats = forwarder.stats();
 
         let rule_engine = RuleEngine::with_limits(config.rules.clone(), settings.rule_limits)?;
-        let dispatcher =
-            ActionDispatcher::with_limits(realtime_sink, forwarder, settings.dispatch_limits);
+        let dispatcher = ActionDispatcher::with_limits_and_command_queue(
+            realtime_sink,
+            forwarder,
+            command_queue.clone(),
+            settings.dispatch_limits,
+        );
         let schema_mappings = Arc::new(config.schema_mappings.clone());
         let pending_brokers = build_pending_broker_runtimes(
             &config,
@@ -584,55 +613,6 @@ impl ProjectRuntime {
 
     pub fn command_queue_handle(&self) -> RuntimeCommandQueueHandle {
         self.command_queue.clone()
-    }
-
-    pub fn execute_command(
-        &self,
-        config: &ProjectConfig,
-        command_template_id: &CommandTemplateId,
-        params: &BTreeMap<String, serde_json::Value>,
-    ) -> Result<QueuedRuntimeCommand, RuntimeError> {
-        let template = config
-            .command_templates
-            .iter()
-            .find(|template| &template.id == command_template_id)
-            .ok_or_else(|| RuntimeError::CommandTemplateNotFound {
-                template_id: command_template_id.to_string(),
-            })?;
-
-        if !template.enabled {
-            return Err(RuntimeError::CommandTemplateDisabled {
-                template_id: command_template_id.to_string(),
-            });
-        }
-
-        let rendered = CommandTemplateRenderer::default()
-            .render_draft(template, params)
-            .map_err(command_render_error_to_runtime)?;
-        let engine = self
-            .mqtt_engines
-            .iter()
-            .find(|broker| broker.broker_id == template.broker_id)
-            .ok_or_else(|| RuntimeError::CommandBrokerUnavailable {
-                broker_id: template.broker_id.to_string(),
-            })?;
-
-        let topic = rendered.topic.as_str().to_owned();
-        engine.engine.handle().try_enqueue_command(
-            topic.clone(),
-            map_qos(template.qos),
-            template.retain,
-            rendered.payload,
-        )?;
-
-        Ok(QueuedRuntimeCommand {
-            command_template_id: template.id.clone(),
-            broker_id: template.broker_id.clone(),
-            topic,
-            qos: template.qos,
-            retain: template.retain,
-            payload_size_bytes: rendered.payload_size_bytes,
-        })
     }
 
     pub async fn shutdown(self) -> Result<(), RuntimeError> {
@@ -1089,17 +1069,6 @@ fn qos_rank(qos: QoS) -> u8 {
     }
 }
 
-fn command_render_error_to_runtime(error: CommandRenderError) -> RuntimeError {
-    if let CommandRenderError::PayloadTooLarge { max, actual, .. } = error {
-        return RuntimeError::CommandPayloadTooLarge { max, actual };
-    }
-
-    RuntimeError::CommandTemplateRender {
-        template_id: error.template_id().to_string(),
-        reason: error.to_string(),
-    }
-}
-
 async fn consume_forward_outcomes(
     mut outcomes: mpsc::Receiver<ForwardDeliveryOutcome>,
     mut shutdown_rx: watch::Receiver<bool>,
@@ -1238,6 +1207,7 @@ fn validate_runtime_config(config: &ProjectConfig) -> Result<(), RuntimeError> {
     validate_routes(config)?;
     validate_command_templates(config)?;
     validate_rule_sink_references(config)?;
+    validate_rule_command_references(config)?;
 
     Ok(())
 }
@@ -1422,6 +1392,40 @@ fn validate_rule_sink_references(config: &ProjectConfig) -> Result<(), RuntimeEr
     Ok(())
 }
 
+fn validate_rule_command_references(config: &ProjectConfig) -> Result<(), RuntimeError> {
+    for rule in config.rules.iter().filter(|rule| rule.enabled) {
+        for action in &rule.actions {
+            let ActionIntentTemplate::ExecuteCommand {
+                command_template_id,
+                ..
+            } = action
+            else {
+                continue;
+            };
+
+            let Some(template) = config
+                .command_templates
+                .iter()
+                .find(|template| &template.id == command_template_id)
+            else {
+                return Err(RuntimeError::RuleReferencesUnknownCommandTemplate {
+                    rule_id: rule.id.to_string(),
+                    template_id: command_template_id.to_string(),
+                });
+            };
+
+            if !template.enabled {
+                return Err(RuntimeError::RuleReferencesDisabledCommandTemplate {
+                    rule_id: rule.id.to_string(),
+                    template_id: command_template_id.to_string(),
+                });
+            }
+        }
+    }
+
+    Ok(())
+}
+
 fn backpressure_policy_name(policy: BackpressurePolicy) -> &'static str {
     match policy {
         BackpressurePolicy::DropNewest => "drop_newest",
@@ -1530,6 +1534,41 @@ mod tests {
         assert!(matches!(
             error,
             RuntimeError::RuleReferencesUnknownSink { .. }
+        ));
+    }
+
+    #[test]
+    fn runtime_rejects_rule_to_unknown_command_template() {
+        let mut config = project_config();
+        config.rules[0].actions = vec![ActionIntentTemplate::ExecuteCommand {
+            command_template_id: CommandTemplateId::new("missing-command").expect("template id"),
+            params: BTreeMap::new(),
+        }];
+
+        let error = validate_runtime_config(&config).expect_err("missing command template error");
+
+        assert!(matches!(
+            error,
+            RuntimeError::RuleReferencesUnknownCommandTemplate { .. }
+        ));
+    }
+
+    #[test]
+    fn runtime_rejects_rule_to_disabled_command_template() {
+        let mut config = project_config();
+        let mut template = command_template("command-1");
+        template.enabled = false;
+        config.command_templates.push(template);
+        config.rules[0].actions = vec![ActionIntentTemplate::ExecuteCommand {
+            command_template_id: CommandTemplateId::new("command-1").expect("template id"),
+            params: BTreeMap::new(),
+        }];
+
+        let error = validate_runtime_config(&config).expect_err("disabled command template error");
+
+        assert!(matches!(
+            error,
+            RuntimeError::RuleReferencesDisabledCommandTemplate { .. }
         ));
     }
 

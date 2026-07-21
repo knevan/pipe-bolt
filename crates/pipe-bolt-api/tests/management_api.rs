@@ -460,6 +460,58 @@ async fn command_execute_returns_accepted_when_runtime_queues_command() -> TestR
 }
 
 #[tokio::test]
+async fn command_execute_returns_too_many_requests_when_command_queue_is_full() -> TestResult {
+    let service = test_service(
+        TestStorage::with_config(runtime_supported_config(1)?),
+        TestRuntime::default()
+            .with_execute_mode(ExecuteMode::QueueFull)
+            .await,
+    )?;
+
+    let mut response = TestClient::post(
+        "http://127.0.0.1:8080/projects/project-test/commands/command-main/execute",
+    )
+    .bearer_auth(TEST_TOKEN)
+    .json(&json!({ "params": { "device_id": "device-1" } }))
+    .send(&service)
+    .await;
+    let body = response.take_json::<Value>().await?;
+
+    assert_eq!(response.status_code, Some(StatusCode::TOO_MANY_REQUESTS));
+    assert_eq!(
+        body.pointer("/error/code").and_then(Value::as_str),
+        Some("too_many_requests")
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn command_execute_returns_not_found_when_command_template_missing() -> TestResult {
+    let service = test_service(
+        TestStorage::with_config(runtime_supported_config(1)?),
+        TestRuntime::default()
+            .with_execute_mode(ExecuteMode::TemplateNotFound)
+            .await,
+    )?;
+
+    let mut response = TestClient::post(
+        "http://127.0.0.1:8080/projects/project-test/commands/missing-command/execute",
+    )
+    .bearer_auth(TEST_TOKEN)
+    .json(&json!({ "params": { "device_id": "device-1" } }))
+    .send(&service)
+    .await;
+    let body = response.take_json::<Value>().await?;
+
+    assert_eq!(response.status_code, Some(StatusCode::NOT_FOUND));
+    assert_eq!(
+        body.pointer("/error/code").and_then(Value::as_str),
+        Some("not_found")
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn list_endpoints_enforce_limit_and_cursor() -> TestResult {
     let storage = TestStorage::with_config(runtime_supported_config(1)?);
     let service = test_service(storage.clone(), TestRuntime::default())?;
@@ -915,6 +967,11 @@ impl TestRuntime {
         self
     }
 
+    async fn with_execute_mode(self, execute_mode: ExecuteMode) -> Self {
+        self.inner.lock().await.execute_mode = execute_mode;
+        self
+    }
+
     async fn reload_audit_reasons(&self) -> Vec<Option<String>> {
         self.inner
             .lock()
@@ -940,6 +997,7 @@ impl TestRuntime {
 struct TestRuntimeState {
     validate_mode: ValidateMode,
     reload_mode: ReloadMode,
+    execute_mode: ExecuteMode,
     reload_audits: Vec<AuditContext>,
     execute_audits: Vec<AuditContext>,
 }
@@ -959,6 +1017,14 @@ enum ReloadMode {
     ShuttingDown,
     UnsafeOldRuntimeShutdown,
     StartFailed,
+}
+
+#[derive(Copy, Clone, Default)]
+enum ExecuteMode {
+    #[default]
+    Success,
+    QueueFull,
+    TemplateNotFound,
 }
 
 #[async_trait]
@@ -1054,19 +1120,25 @@ impl RuntimeControl for TestRuntime {
     ) -> Result<ExecuteCommandResponse, RuntimeControlError> {
         self.inner.lock().await.execute_audits.push(audit);
 
-        Ok(ExecuteCommandResponse {
-            project_id: project_id.clone(),
-            command_template_id: command_template_id.clone(),
-            command_execution_id: CommandExecutionId::new("command-exec-test")
-                .expect("command execution id"),
-            status: CommandExecutionStatusResponse::Queued,
-            broker_id: BrokerId::new("broker-main").expect("broker id"),
-            topic: "devices/device-1/command".to_owned(),
-            qos: MqttQos::AtLeastOnce,
-            retain: false,
-            payload_size_bytes: 14,
-            queued_at: OffsetDateTime::now_utc(),
-            audit_event_id: "audit-test".to_owned(),
-        })
+        match self.inner.lock().await.execute_mode {
+            ExecuteMode::Success => Ok(ExecuteCommandResponse {
+                project_id: project_id.clone(),
+                command_template_id: command_template_id.clone(),
+                command_execution_id: CommandExecutionId::new("command-exec-test")
+                    .expect("command execution id"),
+                status: CommandExecutionStatusResponse::Queued,
+                broker_id: BrokerId::new("broker-main").expect("broker id"),
+                topic: "devices/device-1/command".to_owned(),
+                qos: MqttQos::AtLeastOnce,
+                retain: false,
+                payload_size_bytes: 14,
+                queued_at: OffsetDateTime::now_utc(),
+                audit_event_id: "audit-test".to_owned(),
+            }),
+            ExecuteMode::QueueFull => Err(RuntimeControlError::CommandQueueFull),
+            ExecuteMode::TemplateNotFound => Err(RuntimeControlError::CommandTemplateNotFound {
+                command_template_id: command_template_id.to_string(),
+            }),
+        }
     }
 }

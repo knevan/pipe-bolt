@@ -1,7 +1,11 @@
-﻿use std::collections::BTreeMap;
+use std::collections::BTreeMap;
 
-use pipe_bolt_domain::{ActionIntent, EventId, NormalizedEvent};
+use pipe_bolt_domain::{
+    ActionIntent, CommandExecutionId, CommandExecutionRequest, CommandSource, CommandTemplateId,
+    EventId, NormalizedEvent,
+};
 use tokio::sync::mpsc;
+use uuid::Uuid;
 
 use crate::action_metadata::{
     ActionMetadataLimits, MetadataValidationError, validate_action_metadata,
@@ -80,6 +84,7 @@ impl DispatchOutcome {
 pub enum ExecutedAction {
     StreamToUi { receipt: RealtimePublishReceipt },
     ForwardToSink { receipt: ForwardReceipt },
+    ExecuteCommand { receipt: CommandRequestReceipt },
     AddMetadata { key: String },
     DropEvent,
 }
@@ -112,6 +117,14 @@ pub struct RealtimePublishReceipt {
     pub accepted: bool,
 }
 
+/// Result returned by a bounded command request queue.
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct CommandRequestReceipt {
+    pub command_execution_id: CommandExecutionId,
+    pub command_template_id: CommandTemplateId,
+    pub accepted: bool,
+}
+
 /// Bounded realtime event sink used by StreamToUi dispatch.
 #[derive(Clone)]
 pub struct BoundedRealtimeEventSink {
@@ -139,6 +152,27 @@ pub trait RealtimeEventSink {
     fn try_publish(&self, event: NormalizedEvent) -> Result<RealtimePublishReceipt, DispatchError>;
 }
 
+/// Minimal side-effect boundary required by ExecuteCommand dispatch.
+pub trait CommandRequestQueue {
+    fn try_enqueue_command(
+        &self,
+        request: CommandExecutionRequest,
+    ) -> Result<CommandRequestReceipt, DispatchError>;
+}
+
+/// Explicit no-op implementation for runtimes that have not enabled commands.
+#[derive(Debug, Copy, Clone, Default)]
+pub struct DisabledCommandQueue;
+
+impl CommandRequestQueue for DisabledCommandQueue {
+    fn try_enqueue_command(
+        &self,
+        _request: CommandExecutionRequest,
+    ) -> Result<CommandRequestReceipt, DispatchError> {
+        Err(DispatchError::CommandQueueUnavailable)
+    }
+}
+
 impl RealtimeEventSink for BoundedRealtimeEventSink {
     fn try_publish(&self, event: NormalizedEvent) -> Result<RealtimePublishReceipt, DispatchError> {
         self.tx.try_send(event).map_err(|error| match error {
@@ -152,9 +186,10 @@ impl RealtimeEventSink for BoundedRealtimeEventSink {
 
 /// Deterministic dispatcher for rule action intents.
 #[derive(Clone)]
-pub struct ActionDispatcher<R, F> {
+pub struct ActionDispatcher<R, F, C = DisabledCommandQueue> {
     realtime: R,
     forwarder: F,
+    command_queue: C,
     limits: DispatchLimits,
 }
 
@@ -171,6 +206,37 @@ where
         Self {
             realtime,
             forwarder,
+            command_queue: DisabledCommandQueue,
+            limits,
+        }
+    }
+}
+
+impl<R, F, C> ActionDispatcher<R, F, C>
+where
+    R: RealtimeEventSink,
+    F: EventForwarder,
+    C: CommandRequestQueue,
+{
+    pub fn with_command_queue(realtime: R, forwarder: F, command_queue: C) -> Self {
+        Self::with_limits_and_command_queue(
+            realtime,
+            forwarder,
+            command_queue,
+            DispatchLimits::default(),
+        )
+    }
+
+    pub fn with_limits_and_command_queue(
+        realtime: R,
+        forwarder: F,
+        command_queue: C,
+        limits: DispatchLimits,
+    ) -> Self {
+        Self {
+            realtime,
+            forwarder,
+            command_queue,
             limits,
         }
     }
@@ -253,10 +319,25 @@ where
                         Err(error) => outcome.failed.push(FailedAction { action_type, error }),
                     }
                 }
-                ActionIntent::ExecuteCommand { .. } => {
-                    outcome.skipped.push(SkippedAction::Unsupported {
-                        action_type: "execute_command",
-                    });
+                ActionIntent::ExecuteCommand {
+                    command_template_id,
+                    params,
+                    correlation_id,
+                    ..
+                } => {
+                    match command_request_from_intent(
+                        event,
+                        command_template_id,
+                        params,
+                        correlation_id,
+                    )
+                    .and_then(|request| self.command_queue.try_enqueue_command(request))
+                    {
+                        Ok(receipt) => outcome
+                            .executed
+                            .push(ExecutedAction::ExecuteCommand { receipt }),
+                        Err(error) => outcome.failed.push(FailedAction { action_type, error }),
+                    }
                 }
             }
         }
@@ -341,6 +422,30 @@ fn intent_event_id(intent: &ActionIntent) -> Option<&EventId> {
     }
 }
 
+fn command_request_from_intent(
+    event: &NormalizedEvent,
+    command_template_id: &CommandTemplateId,
+    params: &BTreeMap<String, serde_json::Value>,
+    correlation_id: &str,
+) -> Result<CommandExecutionRequest, DispatchError> {
+    let command_execution_id = CommandExecutionId::new(format!("command_exec_{}", Uuid::now_v7()))
+        .map_err(|_| DispatchError::CommandRequestBuild {
+            reason: "generated command execution id is invalid",
+        })?;
+
+    Ok(CommandExecutionRequest {
+        project_id: event.project_id.clone(),
+        command_execution_id,
+        command_template_id: command_template_id.clone(),
+        params: params.clone(),
+        source: CommandSource::Rule,
+        actor_id: None,
+        source_event_id: Some(event.id.clone()),
+        correlation_id: correlation_id.to_owned(),
+        reason: Some(format!("matched event {}", event.id)),
+    })
+}
+
 fn action_type(intent: &ActionIntent) -> &'static str {
     match intent {
         ActionIntent::StreamToUi { .. } => "stream_to_ui",
@@ -356,8 +461,9 @@ mod tests {
     use std::collections::BTreeMap;
 
     use pipe_bolt_domain::{
-        ActionIntent, ActionIntentTemplate, BrokerId, CommandTemplateId, DecodedPayload, EventId,
-        FieldValue, ProjectId, RouteId, RuleDefinition, RuleId, RuleTrigger, TopicName,
+        ActionIntent, ActionIntentTemplate, BrokerId, CommandExecutionRequest, CommandSource,
+        CommandTemplateId, DecodedPayload, EventId, FieldValue, ProjectId, RouteId, RuleDefinition,
+        RuleId, RuleTrigger, TopicName,
     };
     use serde_json::json;
     use time::OffsetDateTime;
@@ -638,8 +744,49 @@ mod tests {
     }
 
     #[test]
-    fn execute_command_is_skipped_until_command_queue_is_wired() {
-        let (dispatcher, _rx) = dispatcher();
+    fn execute_command_enqueues_command_request_when_queue_is_wired() {
+        let (realtime, _rx) = BoundedRealtimeEventSink::try_channel(1).unwrap();
+        let command_queue = RecordingCommandQueue::default();
+        let dispatcher = ActionDispatcher::with_command_queue(
+            realtime,
+            DisabledForwarder,
+            command_queue.clone(),
+        );
+        let event = event();
+        let command_template_id = CommandTemplateId::new("relay-on").unwrap();
+
+        let outcome = dispatcher
+            .dispatch(
+                &event,
+                &[ActionIntent::ExecuteCommand {
+                    event_id: event.id.clone(),
+                    command_template_id: command_template_id.clone(),
+                    params: BTreeMap::from([("device_id".to_owned(), json!("device-1"))]),
+                    correlation_id: event.correlation_id.clone(),
+                }],
+            )
+            .unwrap();
+
+        assert!(outcome.failed.is_empty());
+        assert_eq!(command_queue.recorded()[0].source, CommandSource::Rule);
+        assert_eq!(command_queue.recorded()[0].source_event_id, Some(event.id));
+        assert_eq!(
+            outcome.executed[0],
+            ExecutedAction::ExecuteCommand {
+                receipt: CommandRequestReceipt {
+                    command_execution_id: command_queue.recorded()[0].command_execution_id.clone(),
+                    command_template_id,
+                    accepted: true,
+                }
+            }
+        );
+    }
+
+    #[test]
+    fn execute_command_reports_failure_when_command_queue_rejects_request() {
+        let (realtime, _rx) = BoundedRealtimeEventSink::try_channel(1).unwrap();
+        let dispatcher =
+            ActionDispatcher::with_command_queue(realtime, DisabledForwarder, FailingCommandQueue);
         let event = event();
 
         let outcome = dispatcher
@@ -654,11 +801,10 @@ mod tests {
             )
             .unwrap();
 
+        assert!(outcome.executed.is_empty());
         assert_eq!(
-            outcome.skipped,
-            vec![SkippedAction::Unsupported {
-                action_type: "execute_command"
-            }]
+            outcome.failed[0].error,
+            DispatchError::CommandQueueBackpressure
         );
     }
 
@@ -768,6 +914,45 @@ mod tests {
                 sink_id,
                 accepted: true,
             })
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct RecordingCommandQueue {
+        requests: std::sync::Arc<std::sync::Mutex<Vec<CommandExecutionRequest>>>,
+    }
+
+    impl RecordingCommandQueue {
+        fn recorded(&self) -> Vec<CommandExecutionRequest> {
+            self.requests.lock().unwrap().clone()
+        }
+    }
+
+    impl CommandRequestQueue for RecordingCommandQueue {
+        fn try_enqueue_command(
+            &self,
+            request: CommandExecutionRequest,
+        ) -> Result<CommandRequestReceipt, DispatchError> {
+            let receipt = CommandRequestReceipt {
+                command_execution_id: request.command_execution_id.clone(),
+                command_template_id: request.command_template_id.clone(),
+                accepted: true,
+            };
+
+            self.requests.lock().unwrap().push(request);
+            Ok(receipt)
+        }
+    }
+
+    #[derive(Copy, Clone)]
+    struct FailingCommandQueue;
+
+    impl CommandRequestQueue for FailingCommandQueue {
+        fn try_enqueue_command(
+            &self,
+            _request: CommandExecutionRequest,
+        ) -> Result<CommandRequestReceipt, DispatchError> {
+            Err(DispatchError::CommandQueueBackpressure)
         }
     }
 }
