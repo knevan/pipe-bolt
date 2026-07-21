@@ -623,6 +623,14 @@ pub struct RuntimePipelineCountersResponse {
     pub realtime_event_no_receiver_total: u64,
     pub forward_outcome_total: u64,
     pub delivery_outcome_persist_failed_total: u64,
+    pub command_queued_total: u64,
+    pub command_queue_full_total: u64,
+    pub command_queue_closed_total: u64,
+    pub command_render_failed_total: u64,
+    pub command_publish_enqueue_failed_total: u64,
+    pub command_published_total: u64,
+    pub command_publish_failed_total: u64,
+    pub command_status_update_failed_total: u64,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Serialize, Default)]

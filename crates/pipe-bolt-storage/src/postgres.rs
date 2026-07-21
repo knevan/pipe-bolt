@@ -438,6 +438,24 @@ impl PostgresStorage {
         Ok(())
     }
 
+    pub async fn mark_command_execution_published(
+        &self,
+        command_execution_id: &CommandExecutionId,
+    ) -> Result<(), StorageError> {
+        sqlx::query(
+            r#"
+            UPDATE command_executions
+            SET status = 'published', failure_reason = NULL
+            WHERE command_execution_id = $1
+            "#,
+        )
+        .bind(command_execution_id.as_str())
+        .execute(self.pool())
+        .await?;
+
+        Ok(())
+    }
+
     pub async fn record_audit_event(&self, event: NewAuditEvent) -> Result<String, StorageError> {
         let mut tx = self.pool.begin().await?;
         let audit_event_id = insert_audit_event_tx(&mut tx, event).await?;

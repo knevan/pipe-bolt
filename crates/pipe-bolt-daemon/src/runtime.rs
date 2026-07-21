@@ -5,6 +5,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use pipe_bolt_core::bus::{
+    MqttCommandContext, MqttCommandPublishOutcome, MqttCommandPublishStatus,
+};
 use pipe_bolt_core::command::{CommandRenderContext, CommandRenderError, CommandTemplateRenderer};
 use pipe_bolt_core::config::{MqttClientConfig, MqttReconnectConfig, MqttTlsMode};
 use pipe_bolt_core::dispatcher::action::{
@@ -25,11 +28,12 @@ use pipe_bolt_core::router::matcher::MqttRouter;
 use pipe_bolt_core::rule::rules::{RuleEngine, RuleEngineLimits};
 use pipe_bolt_domain::{
     ActionIntentTemplate, BackpressurePolicy, BrokerConnectionConfig, BrokerId,
-    CommandExecutionRequest, CommandTemplate, CommandTemplateId, MqttQos, NormalizedEvent,
-    PayloadSchemaMapping, ProjectConfig, ProjectId, RenderedCommand, SinkKind, TlsMode,
-    TopicRouteConfig,
+    CommandExecutionRequest, CommandSource, CommandTemplate, CommandTemplateId, MqttQos,
+    NormalizedEvent, PayloadSchemaMapping, ProjectConfig, ProjectId, RenderedCommand, SinkKind,
+    TlsMode, TopicRouteConfig,
 };
 use pipe_bolt_storage::postgres::PostgresStorage;
+use pipe_bolt_storage::{CommandExecutionStatus, NewCommandExecution, StorageError};
 use rumqttc::QoS;
 use thiserror::Error;
 use tokio::sync::mpsc::error::TrySendError;
@@ -44,6 +48,7 @@ use crate::persistence_writer::{
 
 const DEFAULT_REALTIME_EVENT_CAPACITY: usize = 1024;
 const DEFAULT_COMMAND_EXECUTION_CAPACITY: usize = 256;
+const DEFAULT_COMMAND_PUBLISH_OUTCOME_CAPACITY: usize = 256;
 const DEFAULT_WORKER_JOIN_TIMEOUT: Duration = Duration::from_secs(10);
 
 type RuntimeDispatcher =
@@ -58,6 +63,7 @@ pub struct RuntimeSettings {
     pub dispatch_limits: DispatchLimits,
     pub realtime_event_capacity: usize,
     pub command_queue_capacity: usize,
+    pub command_publish_outcome_capacity: usize,
     pub realtime_bridge_bind_addr: SocketAddr,
     pub worker_join_timeout: Duration,
 }
@@ -72,6 +78,7 @@ impl Default for RuntimeSettings {
             dispatch_limits: DispatchLimits::default(),
             realtime_event_capacity: DEFAULT_REALTIME_EVENT_CAPACITY,
             command_queue_capacity: DEFAULT_COMMAND_EXECUTION_CAPACITY,
+            command_publish_outcome_capacity: DEFAULT_COMMAND_PUBLISH_OUTCOME_CAPACITY,
             realtime_bridge_bind_addr: SocketAddr::from(([0, 0, 0, 0], 8080)),
             worker_join_timeout: DEFAULT_WORKER_JOIN_TIMEOUT,
         }
@@ -200,6 +207,9 @@ pub struct RuntimeStatsSnapshot {
     pub command_queue_closed_total: u64,
     pub command_render_failed_total: u64,
     pub command_publish_enqueue_failed_total: u64,
+    pub command_published_total: u64,
+    pub command_publish_failed_total: u64,
+    pub command_status_update_failed_total: u64,
 }
 
 #[derive(Debug, Default)]
@@ -217,6 +227,9 @@ pub struct RuntimeStats {
     command_queue_closed_total: AtomicU64,
     command_render_failed_total: AtomicU64,
     command_publish_enqueue_failed_total: AtomicU64,
+    command_published_total: AtomicU64,
+    command_publish_failed_total: AtomicU64,
+    command_status_update_failed_total: AtomicU64,
 }
 
 impl RuntimeStats {
@@ -242,6 +255,11 @@ impl RuntimeStats {
             command_render_failed_total: self.command_render_failed_total.load(Ordering::Relaxed),
             command_publish_enqueue_failed_total: self
                 .command_publish_enqueue_failed_total
+                .load(Ordering::Relaxed),
+            command_published_total: self.command_published_total.load(Ordering::Relaxed),
+            command_publish_failed_total: self.command_publish_failed_total.load(Ordering::Relaxed),
+            command_status_update_failed_total: self
+                .command_status_update_failed_total
                 .load(Ordering::Relaxed),
         }
     }
@@ -297,6 +315,20 @@ impl RuntimeStats {
 
     fn record_command_publish_enqueue_failed(&self) {
         self.command_publish_enqueue_failed_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_command_published(&self) {
+        self.command_published_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_command_publish_failed(&self) {
+        self.command_publish_failed_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_command_status_update_failed(&self) {
+        self.command_status_update_failed_total
             .fetch_add(1, Ordering::Relaxed);
     }
 }
@@ -432,8 +464,16 @@ impl CommandPublishSink for MqttCommandPublishSink {
         let topic = command.topic().as_str().to_owned();
         let qos = map_qos(command.qos());
         let retain = command.retain();
+        let context = MqttCommandContext {
+            project_id: command.project_id().clone(),
+            broker_id: command.broker_id().clone(),
+            command_template_id: command.command_template_id().clone(),
+            command_execution_id: command.command_execution_id().clone(),
+            correlation_id: command.correlation_id().to_owned(),
+        };
+
         self.handle
-            .try_enqueue_command(topic, qos, retain, command.into_payload())
+            .try_enqueue_tracked_command(context, topic, qos, retain, command.into_payload())
     }
 }
 
@@ -448,6 +488,7 @@ struct CommandProcessor {
     brokers: Arc<Vec<CommandProcessorBroker>>,
     renderer: CommandTemplateRenderer,
     stats: Arc<RuntimeStats>,
+    storage: Option<Arc<PostgresStorage>>,
 }
 
 #[derive(Debug, Error)]
@@ -479,6 +520,15 @@ enum RuntimeCommandProcessorError {
         #[source]
         source: Box<MqttEngineError>,
     },
+
+    #[error("command audit record failed: {source}")]
+    AuditRecord {
+        #[source]
+        source: Box<StorageError>,
+    },
+
+    #[error("command audit storage is unavailable")]
+    AuditUnavailable,
 }
 
 impl ProjectRuntime {
@@ -499,6 +549,8 @@ impl ProjectRuntime {
         let (realtime_tx, _) = broadcast::channel(settings.realtime_event_capacity);
         let (command_queue, command_rx) =
             command_queue_channel(settings.command_queue_capacity, Arc::clone(&stats));
+        let (command_publish_outcome_tx, command_publish_outcome_rx) =
+            mpsc::channel(settings.command_publish_outcome_capacity);
         let realtime_sink = RuntimeRealtimeSink::new(realtime_tx.clone(), Arc::clone(&stats));
 
         let (forwarder, forward_worker, forward_outcomes) =
@@ -528,7 +580,11 @@ impl ProjectRuntime {
 
         let mut mqtt_engines = Vec::with_capacity(pending_brokers.len());
         for pending in pending_brokers {
-            match MqttEngine::spawn(pending.config, pending.router) {
+            match MqttEngine::spawn_with_publish_outcomes(
+                pending.config,
+                pending.router,
+                command_publish_outcome_tx.clone(),
+            ) {
                 Ok(engine) => mqtt_engines.push(BrokerRuntime {
                     broker_id: pending.broker_id,
                     engine,
@@ -539,6 +595,11 @@ impl ProjectRuntime {
                 }
             }
         }
+        drop(command_publish_outcome_tx);
+
+        let command_storage = persistence
+            .as_ref()
+            .map(|persistence| Arc::clone(&persistence.storage));
 
         let persistence_writer = persistence
             .map(|persistence| {
@@ -553,7 +614,12 @@ impl ProjectRuntime {
         let persistence_handle = persistence_writer
             .as_ref()
             .map(RuntimePersistenceWriter::handle);
-        let command_processor = build_command_processor(&config, &mqtt_engines, Arc::clone(&stats));
+        let command_processor = build_command_processor(
+            &config,
+            &mqtt_engines,
+            Arc::clone(&stats),
+            command_storage.clone(),
+        );
 
         let mut workers = Vec::new();
         workers.push(RuntimeWorker::spawn("forwarder", async move {
@@ -571,6 +637,15 @@ impl ProjectRuntime {
                 shutdown_tx.subscribe(),
                 Arc::clone(&stats),
                 persistence_handle,
+            ),
+        ));
+        workers.push(RuntimeWorker::spawn(
+            "command-publish-outcome-consumer",
+            consume_command_publish_outcomes(
+                command_publish_outcome_rx,
+                shutdown_tx.subscribe(),
+                Arc::clone(&stats),
+                command_storage,
             ),
         ));
 
@@ -738,6 +813,7 @@ fn build_command_processor(
     config: &ProjectConfig,
     mqtt_engines: &[BrokerRuntime],
     stats: Arc<RuntimeStats>,
+    storage: Option<Arc<PostgresStorage>>,
 ) -> CommandProcessor {
     let brokers = mqtt_engines
         .iter()
@@ -759,6 +835,7 @@ fn build_command_processor(
         brokers: Arc::new(brokers),
         renderer: CommandTemplateRenderer::default(),
         stats,
+        storage,
     }
 }
 
@@ -783,23 +860,23 @@ async fn run_command_processor(
                     break;
                 };
 
-                process_and_record_command_request(&processor, &request);
+                process_and_record_command_request(&processor, &request).await;
             }
         }
     }
 
     while let Some(request) = command_rx.recv().await {
-        process_and_record_command_request(&processor, &request);
+        process_and_record_command_request(&processor, &request).await;
     }
 
     Ok(())
 }
 
-fn process_and_record_command_request(
+async fn process_and_record_command_request(
     processor: &CommandProcessor,
     request: &CommandExecutionRequest,
 ) {
-    match process_command_request(processor, request) {
+    match process_command_request(processor, request).await {
         Ok(()) => {
             tracing::info!(
                 project_id = %request.project_id,
@@ -811,6 +888,7 @@ fn process_and_record_command_request(
         }
         Err(error) => {
             record_command_processor_error(&processor.stats, &error);
+            mark_command_failed_after_processor_error(processor, request, &error).await;
             tracing::warn!(
                 project_id = %request.project_id,
                 command_execution_id = %request.command_execution_id,
@@ -823,7 +901,7 @@ fn process_and_record_command_request(
     }
 }
 
-fn process_command_request(
+async fn process_command_request(
     processor: &CommandProcessor,
     request: &CommandExecutionRequest,
 ) -> Result<(), RuntimeCommandProcessorError> {
@@ -872,6 +950,8 @@ fn process_command_request(
             broker_id: broker_id.clone(),
         })?;
 
+    record_rule_command_execution(processor, request, &rendered).await?;
+
     broker
         .sink
         .try_enqueue_rendered(rendered)
@@ -881,12 +961,75 @@ fn process_command_request(
         })
 }
 
+async fn record_rule_command_execution(
+    processor: &CommandProcessor,
+    request: &CommandExecutionRequest,
+    rendered: &RenderedCommand,
+) -> Result<(), RuntimeCommandProcessorError> {
+    if request.source != CommandSource::Rule {
+        return Ok(());
+    }
+
+    let Some(storage) = &processor.storage else {
+        return Err(RuntimeCommandProcessorError::AuditUnavailable);
+    };
+
+    storage
+        .record_command_execution(NewCommandExecution {
+            command_execution_id: request.command_execution_id.clone(),
+            project_id: request.project_id.clone(),
+            command_template_id: request.command_template_id.clone(),
+            broker_id: rendered.broker_id().clone(),
+            actor_id: request.actor_id.clone(),
+            status: CommandExecutionStatus::Queued,
+            topic: rendered.topic().as_str().to_owned(),
+            qos: rendered.qos(),
+            retain: rendered.retain(),
+            payload_size_bytes: rendered.payload_size_bytes(),
+            failure_reason: None,
+            reason: request.reason.clone(),
+        })
+        .await
+        .map_err(|source| RuntimeCommandProcessorError::AuditRecord {
+            source: Box::new(source),
+        })?;
+
+    Ok(())
+}
+
+async fn mark_command_failed_after_processor_error(
+    processor: &CommandProcessor,
+    request: &CommandExecutionRequest,
+    error: &RuntimeCommandProcessorError,
+) {
+    let Some(storage) = &processor.storage else {
+        return;
+    };
+
+    if let Err(storage_error) = storage
+        .mark_command_execution_failed(&request.command_execution_id, &error.to_string())
+        .await
+    {
+        processor.stats.record_command_status_update_failed();
+        tracing::warn!(
+            project_id = %request.project_id,
+            command_execution_id = %request.command_execution_id,
+            error = %storage_error,
+            "failed to mark command execution failed after processor rejection"
+        );
+    }
+}
+
 fn record_command_processor_error(stats: &RuntimeStats, error: &RuntimeCommandProcessorError) {
     match error {
         RuntimeCommandProcessorError::Render { .. } => stats.record_command_render_failed(),
         RuntimeCommandProcessorError::PublishEnqueue { .. } => {
             stats.record_command_publish_enqueue_failed();
         }
+        RuntimeCommandProcessorError::AuditRecord { .. } => {
+            stats.record_command_status_update_failed();
+        }
+        RuntimeCommandProcessorError::AuditUnavailable => {}
         RuntimeCommandProcessorError::ProjectMismatch { .. }
         | RuntimeCommandProcessorError::CommandTemplateNotFound { .. }
         | RuntimeCommandProcessorError::CommandTemplateDisabled { .. }
@@ -1103,6 +1246,98 @@ async fn consume_forward_outcomes(
     Ok(())
 }
 
+async fn consume_command_publish_outcomes(
+    mut outcomes: mpsc::Receiver<MqttCommandPublishOutcome>,
+    mut shutdown_rx: watch::Receiver<bool>,
+    stats: Arc<RuntimeStats>,
+    storage: Option<Arc<PostgresStorage>>,
+) -> Result<(), RuntimeError> {
+    loop {
+        tokio::select! {
+            biased;
+
+            changed = shutdown_rx.changed() => {
+                if changed.is_err() || *shutdown_rx.borrow() {
+                    outcomes.close();
+                    break;
+                }
+            }
+
+            outcome = outcomes.recv() => {
+                let Some(outcome) = outcome else {
+                    break;
+                };
+
+                record_command_publish_outcome(&stats, storage.as_deref(), &outcome).await;
+            }
+        }
+    }
+
+    while let Some(outcome) = outcomes.recv().await {
+        record_command_publish_outcome(&stats, storage.as_deref(), &outcome).await;
+    }
+
+    Ok(())
+}
+
+async fn record_command_publish_outcome(
+    stats: &RuntimeStats,
+    storage: Option<&PostgresStorage>,
+    outcome: &MqttCommandPublishOutcome,
+) {
+    match outcome.status {
+        MqttCommandPublishStatus::Published => {
+            stats.record_command_published();
+            if let Some(storage) = storage
+                && let Err(error) = storage
+                    .mark_command_execution_published(&outcome.context.command_execution_id)
+                    .await
+            {
+                stats.record_command_status_update_failed();
+                tracing::warn!(
+                    project_id = %outcome.context.project_id,
+                    broker_id = %outcome.context.broker_id,
+                    command_execution_id = %outcome.context.command_execution_id,
+                    error = %error,
+                    "failed to mark command execution published"
+                );
+            }
+        }
+        MqttCommandPublishStatus::Failed => {
+            stats.record_command_publish_failed();
+            let reason = outcome
+                .failure_reason
+                .as_deref()
+                .unwrap_or("MQTT command publish failed");
+            if let Some(storage) = storage
+                && let Err(error) = storage
+                    .mark_command_execution_failed(&outcome.context.command_execution_id, reason)
+                    .await
+            {
+                stats.record_command_status_update_failed();
+                tracing::warn!(
+                    project_id = %outcome.context.project_id,
+                    broker_id = %outcome.context.broker_id,
+                    command_execution_id = %outcome.context.command_execution_id,
+                    error = %error,
+                    "failed to mark command execution publish failure"
+                );
+            }
+        }
+    }
+
+    tracing::info!(
+        project_id = %outcome.context.project_id,
+        broker_id = %outcome.context.broker_id,
+        command_execution_id = %outcome.context.command_execution_id,
+        command_template_id = %outcome.context.command_template_id,
+        correlation_id = %outcome.context.correlation_id,
+        topic = %outcome.topic,
+        status = ?outcome.status,
+        "command publish outcome"
+    );
+}
+
 fn record_forward_outcome(
     stats: &RuntimeStats,
     persistence: Option<&PersistenceWriterHandle>,
@@ -1189,6 +1424,12 @@ fn validate_runtime_settings(settings: &RuntimeSettings) -> Result<(), RuntimeEr
     if settings.command_queue_capacity == 0 {
         return Err(RuntimeError::InvalidConfig(
             "command queue capacity must be greater than zero",
+        ));
+    }
+
+    if settings.command_publish_outcome_capacity == 0 {
+        return Err(RuntimeError::InvalidConfig(
+            "command publish outcome capacity must be greater than zero",
         ));
     }
 
@@ -1609,6 +1850,18 @@ mod tests {
     }
 
     #[test]
+    fn runtime_settings_should_reject_zero_command_publish_outcome_capacity() {
+        let settings = RuntimeSettings {
+            command_publish_outcome_capacity: 0,
+            ..RuntimeSettings::default()
+        };
+
+        let error = validate_runtime_settings(&settings).expect_err("invalid settings");
+
+        assert!(matches!(error, RuntimeError::InvalidConfig(_)));
+    }
+
+    #[test]
     fn command_queue_should_report_full_when_capacity_is_exhausted() {
         let stats = Arc::new(RuntimeStats::default());
         let (handle, _rx) = command_queue_channel(1, Arc::clone(&stats));
@@ -1636,8 +1889,8 @@ mod tests {
         assert_eq!(error, RuntimeCommandQueueError::Closed);
     }
 
-    #[test]
-    fn command_processor_should_render_and_enqueue_request_when_request_is_valid() {
+    #[tokio::test]
+    async fn command_processor_should_render_and_enqueue_request_when_request_is_valid() {
         let sink = Arc::new(RecordingCommandSink::default());
         let processor =
             command_processor_with_sink(command_template("command-1"), Arc::clone(&sink));
@@ -1646,7 +1899,9 @@ mod tests {
             ("state".to_owned(), serde_json::json!("ON")),
         ]));
 
-        process_command_request(&processor, &request).expect("command processed");
+        process_command_request(&processor, &request)
+            .await
+            .expect("command processed");
         let commands = sink.commands.lock().expect("commands lock");
 
         assert_eq!(
@@ -1655,8 +1910,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn command_processor_should_return_render_error_when_params_are_missing() {
+    #[tokio::test]
+    async fn command_processor_should_return_render_error_when_params_are_missing() {
         let sink = Arc::new(RecordingCommandSink::default());
         let processor = command_processor_with_sink(command_template("command-1"), sink);
         let request = command_request_with_params(BTreeMap::from([(
@@ -1664,13 +1919,15 @@ mod tests {
             serde_json::json!("ON"),
         )]));
 
-        let error = process_command_request(&processor, &request).expect_err("render error");
+        let error = process_command_request(&processor, &request)
+            .await
+            .expect_err("render error");
 
         assert!(matches!(error, RuntimeCommandProcessorError::Render { .. }));
     }
 
-    #[test]
-    fn command_processor_should_return_publish_error_when_mqtt_queue_rejects_command() {
+    #[tokio::test]
+    async fn command_processor_should_return_publish_error_when_mqtt_queue_rejects_command() {
         let sink = Arc::new(FailingCommandSink);
         let processor = command_processor_with_sink(command_template("command-1"), sink);
         let request = command_request_with_params(BTreeMap::from([
@@ -1678,12 +1935,57 @@ mod tests {
             ("state".to_owned(), serde_json::json!("ON")),
         ]));
 
-        let error = process_command_request(&processor, &request).expect_err("publish error");
+        let error = process_command_request(&processor, &request)
+            .await
+            .expect_err("publish error");
 
         assert!(matches!(
             error,
             RuntimeCommandProcessorError::PublishEnqueue { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn command_processor_should_reject_rule_command_when_audit_storage_is_unavailable() {
+        let sink = Arc::new(RecordingCommandSink::default());
+        let processor = command_processor_with_sink(command_template("command-1"), sink);
+        let mut request = command_request_with_params(BTreeMap::from([
+            ("device_id".to_owned(), serde_json::json!("device-1")),
+            ("state".to_owned(), serde_json::json!("ON")),
+        ]));
+        request.source = CommandSource::Rule;
+
+        let error = process_command_request(&processor, &request)
+            .await
+            .expect_err("audit unavailable");
+
+        assert!(matches!(
+            error,
+            RuntimeCommandProcessorError::AuditUnavailable
+        ));
+    }
+
+    #[tokio::test]
+    async fn command_publish_outcome_should_increment_published_counter() {
+        let stats = RuntimeStats::default();
+        let outcome = command_publish_outcome(MqttCommandPublishStatus::Published, None);
+
+        record_command_publish_outcome(&stats, None, &outcome).await;
+
+        assert_eq!(stats.snapshot().command_published_total, 1);
+    }
+
+    #[tokio::test]
+    async fn command_publish_outcome_should_increment_failed_counter() {
+        let stats = RuntimeStats::default();
+        let outcome = command_publish_outcome(
+            MqttCommandPublishStatus::Failed,
+            Some("client disconnected".to_owned()),
+        );
+
+        record_command_publish_outcome(&stats, None, &outcome).await;
+
+        assert_eq!(stats.snapshot().command_publish_failed_total, 1);
     }
 
     #[tokio::test]
@@ -1844,6 +2146,27 @@ mod tests {
             }]),
             renderer: CommandTemplateRenderer::default(),
             stats: Arc::new(RuntimeStats::default()),
+            storage: None,
+        }
+    }
+
+    fn command_publish_outcome(
+        status: MqttCommandPublishStatus,
+        failure_reason: Option<String>,
+    ) -> MqttCommandPublishOutcome {
+        MqttCommandPublishOutcome {
+            context: MqttCommandContext {
+                project_id: ProjectId::new("project-local").expect("project id"),
+                broker_id: BrokerId::new("broker-local").expect("broker id"),
+                command_template_id: CommandTemplateId::new("command-1")
+                    .expect("command template id"),
+                command_execution_id: CommandExecutionId::new("command-exec-1")
+                    .expect("command execution id"),
+                correlation_id: "corr-1".to_owned(),
+            },
+            topic: "devices/device-1/commands/relay".to_owned(),
+            status,
+            failure_reason,
         }
     }
 

@@ -1,5 +1,6 @@
 ﻿use std::time::SystemTime;
 
+use pipe_bolt_domain::{BrokerId, CommandExecutionId, CommandTemplateId, ProjectId};
 use rumqttc::QoS;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{broadcast, mpsc};
@@ -47,6 +48,7 @@ pub struct MqttCommand {
     pub qos: QoS,
     pub retain: bool,
     pub payload: Vec<u8>,
+    pub context: Option<MqttCommandContext>,
 }
 
 impl MqttCommand {
@@ -61,8 +63,48 @@ impl MqttCommand {
             qos,
             retain,
             payload: payload.into(),
+            context: None,
         }
     }
+
+    pub fn publish_with_context(
+        context: MqttCommandContext,
+        topic: impl Into<String>,
+        qos: QoS,
+        retain: bool,
+        payload: impl Into<Vec<u8>>,
+    ) -> Self {
+        Self {
+            topic: topic.into(),
+            qos,
+            retain,
+            payload: payload.into(),
+            context: Some(context),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct MqttCommandContext {
+    pub project_id: ProjectId,
+    pub broker_id: BrokerId,
+    pub command_template_id: CommandTemplateId,
+    pub command_execution_id: CommandExecutionId,
+    pub correlation_id: String,
+}
+
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub enum MqttCommandPublishStatus {
+    Published,
+    Failed,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct MqttCommandPublishOutcome {
+    pub context: MqttCommandContext,
+    pub topic: String,
+    pub status: MqttCommandPublishStatus,
+    pub failure_reason: Option<String>,
 }
 
 #[derive(Clone)]

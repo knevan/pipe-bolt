@@ -6,7 +6,10 @@ use tokio::sync::{broadcast, mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep};
 
-use crate::bus::{BusConfig, InternalBus, InternalBusHandle, MqttCommand, TelemetryEvent};
+use crate::bus::{
+    BusConfig, InternalBus, InternalBusHandle, MqttCommand, MqttCommandContext,
+    MqttCommandPublishOutcome, MqttCommandPublishStatus, TelemetryEvent,
+};
 use crate::config::MqttClientConfig;
 use crate::error::MqttEngineError;
 use crate::message::envelope::MqttMessage;
@@ -49,6 +52,21 @@ impl MqttHandle {
             .try_enqueue_command(MqttCommand::publish(topic, qos, retain, payload))
     }
 
+    /// Enqueues a command whose MQTT publish outcome must be reported to runtime status tracking.
+    pub fn try_enqueue_tracked_command(
+        &self,
+        context: MqttCommandContext,
+        topic: impl Into<String>,
+        qos: QoS,
+        retain: bool,
+        payload: impl Into<Vec<u8>>,
+    ) -> Result<(), MqttEngineError> {
+        self.bus
+            .try_enqueue_command(MqttCommand::publish_with_context(
+                context, topic, qos, retain, payload,
+            ))
+    }
+
     pub fn subscribe_telemetry(&self) -> broadcast::Receiver<TelemetryEvent> {
         self.bus.subscribe_telemetry()
     }
@@ -81,13 +99,35 @@ pub struct MqttEngine {
 
 impl MqttEngine {
     pub fn spawn(config: MqttClientConfig, router: MqttRouter) -> Result<Self, MqttEngineError> {
-        Self::spawn_with_bus(config, router, BusConfig::default())
+        Self::spawn_with_bus_and_outcomes(config, router, BusConfig::default(), None)
     }
 
     pub fn spawn_with_bus(
         config: MqttClientConfig,
         router: MqttRouter,
         bus_config: BusConfig,
+    ) -> Result<Self, MqttEngineError> {
+        Self::spawn_with_bus_and_outcomes(config, router, bus_config, None)
+    }
+
+    pub fn spawn_with_publish_outcomes(
+        config: MqttClientConfig,
+        router: MqttRouter,
+        command_outcome_tx: mpsc::Sender<MqttCommandPublishOutcome>,
+    ) -> Result<Self, MqttEngineError> {
+        Self::spawn_with_bus_and_outcomes(
+            config,
+            router,
+            BusConfig::default(),
+            Some(command_outcome_tx),
+        )
+    }
+
+    fn spawn_with_bus_and_outcomes(
+        config: MqttClientConfig,
+        router: MqttRouter,
+        bus_config: BusConfig,
+        command_outcome_tx: Option<mpsc::Sender<MqttCommandPublishOutcome>>,
     ) -> Result<Self, MqttEngineError> {
         config.validate()?;
 
@@ -115,7 +155,12 @@ impl MqttEngine {
             ingress_rx,
             shutdown_rx.clone(),
         ));
-        let command_worker = tokio::spawn(run_command_worker(client, command_rx, shutdown_rx));
+        let command_worker = tokio::spawn(run_command_worker(
+            client,
+            command_rx,
+            command_outcome_tx,
+            shutdown_rx,
+        ));
 
         Ok(Self {
             handle,
@@ -258,6 +303,7 @@ async fn run_router_worker(
 async fn run_command_worker(
     client: AsyncClient,
     mut command_rx: mpsc::Receiver<MqttCommand>,
+    command_outcome_tx: Option<mpsc::Sender<MqttCommandPublishOutcome>>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
     loop {
@@ -275,12 +321,93 @@ async fn run_command_worker(
                     break;
                 };
 
-                if let Err(err) = client.publish(
-                    command.topic, command.qos, command.retain, command.payload
-                ).await
-                {
-                    tracing::warn!(error = %err, "MQTT command publish failed");
-                }
+                publish_command(&client, &command_outcome_tx, command).await;
+            }
+        }
+    }
+}
+
+async fn publish_command(
+    client: &AsyncClient,
+    command_outcome_tx: &Option<mpsc::Sender<MqttCommandPublishOutcome>>,
+    command: MqttCommand,
+) {
+    let topic = command.topic;
+    let context = command.context;
+    let result = client
+        .publish(topic.clone(), command.qos, command.retain, command.payload)
+        .await;
+
+    match result {
+        Ok(()) => {
+            if let Some(context) = context {
+                report_command_publish_outcome(
+                    command_outcome_tx,
+                    MqttCommandPublishOutcome {
+                        context,
+                        topic,
+                        status: MqttCommandPublishStatus::Published,
+                        failure_reason: None,
+                    },
+                );
+            }
+        }
+        Err(err) => {
+            let reason = err.to_string();
+            if let Some(context) = context {
+                tracing::warn!(
+                    project_id = %context.project_id,
+                    broker_id = %context.broker_id,
+                    command_execution_id = %context.command_execution_id,
+                    command_template_id = %context.command_template_id,
+                    correlation_id = %context.correlation_id,
+                    topic = %topic,
+                    error = %reason,
+                    "MQTT command publish failed"
+                );
+                report_command_publish_outcome(
+                    command_outcome_tx,
+                    MqttCommandPublishOutcome {
+                        context,
+                        topic,
+                        status: MqttCommandPublishStatus::Failed,
+                        failure_reason: Some(reason),
+                    },
+                );
+            } else {
+                tracing::warn!(topic = %topic, error = %reason, "MQTT command publish failed");
+            }
+        }
+    }
+}
+
+fn report_command_publish_outcome(
+    command_outcome_tx: &Option<mpsc::Sender<MqttCommandPublishOutcome>>,
+    outcome: MqttCommandPublishOutcome,
+) {
+    let Some(command_outcome_tx) = command_outcome_tx else {
+        return;
+    };
+
+    if let Err(err) = command_outcome_tx.try_send(outcome) {
+        match err {
+            mpsc::error::TrySendError::Full(outcome) => {
+                tracing::warn!(
+                    project_id = %outcome.context.project_id,
+                    broker_id = %outcome.context.broker_id,
+                    command_execution_id = %outcome.context.command_execution_id,
+                    command_template_id = %outcome.context.command_template_id,
+                    "MQTT command publish outcome queue full; dropping outcome"
+                );
+            }
+            mpsc::error::TrySendError::Closed(outcome) => {
+                tracing::debug!(
+                    project_id = %outcome.context.project_id,
+                    broker_id = %outcome.context.broker_id,
+                    command_execution_id = %outcome.context.command_execution_id,
+                    command_template_id = %outcome.context.command_template_id,
+                    "MQTT command publish outcome queue closed"
+                );
             }
         }
     }
