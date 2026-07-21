@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use pipe_bolt_core::command::{CommandRenderError, CommandTemplateRenderer};
+use pipe_bolt_core::command::{CommandRenderContext, CommandRenderError, CommandTemplateRenderer};
 use pipe_bolt_core::config::{MqttClientConfig, MqttReconnectConfig, MqttTlsMode};
 use pipe_bolt_core::dispatcher::action::{
     ActionDispatcher, DispatchLimits, RealtimeEventSink, RealtimePublishReceipt,
@@ -16,20 +16,22 @@ use pipe_bolt_core::forwarder::{
     ForwarderStatsSnapshot,
 };
 use pipe_bolt_core::message::envelope::MqttMessage;
-use pipe_bolt_core::mqtt::engine::MqttEngine;
+use pipe_bolt_core::mqtt::engine::{MqttEngine, MqttHandle};
 use pipe_bolt_core::pipeline::normalize_routed_message;
 use pipe_bolt_core::pipeline::normalizer::{EventNormalizer, NormalizerLimits};
 use pipe_bolt_core::pipeline::router::ConfigRouteMatcher;
 use pipe_bolt_core::router::matcher::MqttRouter;
 use pipe_bolt_core::rule::rules::{RuleEngine, RuleEngineLimits};
 use pipe_bolt_domain::{
-    ActionIntentTemplate, BackpressurePolicy, BrokerConnectionConfig, BrokerId, CommandTemplateId,
-    MqttQos, NormalizedEvent, PayloadSchemaMapping, ProjectConfig, ProjectId, SinkKind, TlsMode,
+    ActionIntentTemplate, BackpressurePolicy, BrokerConnectionConfig, BrokerId,
+    CommandExecutionRequest, CommandTemplate, CommandTemplateId, MqttQos, NormalizedEvent,
+    PayloadSchemaMapping, ProjectConfig, ProjectId, RenderedCommand, SinkKind, TlsMode,
     TopicRouteConfig,
 };
 use pipe_bolt_storage::postgres::PostgresStorage;
 use rumqttc::QoS;
 use thiserror::Error;
+use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{broadcast, mpsc, watch};
 use tokio::task::{JoinError, JoinHandle};
 use tokio::time::timeout;
@@ -40,6 +42,7 @@ use crate::persistence_writer::{
 };
 
 const DEFAULT_REALTIME_EVENT_CAPACITY: usize = 1024;
+const DEFAULT_COMMAND_EXECUTION_CAPACITY: usize = 256;
 const DEFAULT_WORKER_JOIN_TIMEOUT: Duration = Duration::from_secs(10);
 
 type RuntimeDispatcher = ActionDispatcher<RuntimeRealtimeSink, BoundedHttpForwarder>;
@@ -52,6 +55,7 @@ pub struct RuntimeSettings {
     pub rule_limits: RuleEngineLimits,
     pub dispatch_limits: DispatchLimits,
     pub realtime_event_capacity: usize,
+    pub command_queue_capacity: usize,
     pub realtime_bridge_bind_addr: SocketAddr,
     pub worker_join_timeout: Duration,
 }
@@ -65,6 +69,7 @@ impl Default for RuntimeSettings {
             rule_limits: RuleEngineLimits::default(),
             dispatch_limits: DispatchLimits::default(),
             realtime_event_capacity: DEFAULT_REALTIME_EVENT_CAPACITY,
+            command_queue_capacity: DEFAULT_COMMAND_EXECUTION_CAPACITY,
             realtime_bridge_bind_addr: SocketAddr::from(([0, 0, 0, 0], 8080)),
             worker_join_timeout: DEFAULT_WORKER_JOIN_TIMEOUT,
         }
@@ -176,6 +181,11 @@ pub struct RuntimeStatsSnapshot {
     pub realtime_event_no_receiver_total: u64,
     pub forward_outcome_total: u64,
     pub delivery_outcome_persist_failed_total: u64,
+    pub command_queued_total: u64,
+    pub command_queue_full_total: u64,
+    pub command_queue_closed_total: u64,
+    pub command_render_failed_total: u64,
+    pub command_publish_enqueue_failed_total: u64,
 }
 
 #[derive(Debug, Default)]
@@ -188,6 +198,11 @@ pub struct RuntimeStats {
     realtime_event_no_receiver_total: AtomicU64,
     forward_outcome_total: AtomicU64,
     delivery_outcome_persist_failed_total: AtomicU64,
+    command_queued_total: AtomicU64,
+    command_queue_full_total: AtomicU64,
+    command_queue_closed_total: AtomicU64,
+    command_render_failed_total: AtomicU64,
+    command_publish_enqueue_failed_total: AtomicU64,
 }
 
 impl RuntimeStats {
@@ -206,6 +221,13 @@ impl RuntimeStats {
             forward_outcome_total: self.forward_outcome_total.load(Ordering::Relaxed),
             delivery_outcome_persist_failed_total: self
                 .delivery_outcome_persist_failed_total
+                .load(Ordering::Relaxed),
+            command_queued_total: self.command_queued_total.load(Ordering::Relaxed),
+            command_queue_full_total: self.command_queue_full_total.load(Ordering::Relaxed),
+            command_queue_closed_total: self.command_queue_closed_total.load(Ordering::Relaxed),
+            command_render_failed_total: self.command_render_failed_total.load(Ordering::Relaxed),
+            command_publish_enqueue_failed_total: self
+                .command_publish_enqueue_failed_total
                 .load(Ordering::Relaxed),
         }
     }
@@ -238,6 +260,66 @@ impl RuntimeStats {
 
     fn record_forward_outcome(&self) {
         self.forward_outcome_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_command_queued(&self) {
+        self.command_queued_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_command_queue_full(&self) {
+        self.command_queue_full_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_command_queue_closed(&self) {
+        self.command_queue_closed_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_command_render_failed(&self) {
+        self.command_render_failed_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_command_publish_enqueue_failed(&self) {
+        self.command_publish_enqueue_failed_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[derive(Debug, Error, Copy, Clone, Eq, PartialEq)]
+pub enum RuntimeCommandQueueError {
+    #[error("command execution queue is full")]
+    Full,
+
+    #[error("command execution queue is closed")]
+    Closed,
+}
+
+#[derive(Clone)]
+pub struct RuntimeCommandQueueHandle {
+    tx: mpsc::Sender<CommandExecutionRequest>,
+    stats: Arc<RuntimeStats>,
+}
+
+impl RuntimeCommandQueueHandle {
+    pub fn try_enqueue(
+        &self,
+        request: CommandExecutionRequest,
+    ) -> Result<(), RuntimeCommandQueueError> {
+        self.tx.try_send(request).map_err(|error| match error {
+            TrySendError::Full(_) => {
+                self.stats.record_command_queue_full();
+                RuntimeCommandQueueError::Full
+            }
+            TrySendError::Closed(_) => {
+                self.stats.record_command_queue_closed();
+                RuntimeCommandQueueError::Closed
+            }
+        })?;
+
+        self.stats.record_command_queued();
+        Ok(())
     }
 }
 
@@ -288,6 +370,7 @@ impl RealtimeEventSink for RuntimeRealtimeSink {
 
 pub struct ProjectRuntime {
     mqtt_engines: Vec<BrokerRuntime>,
+    command_queue: RuntimeCommandQueueHandle,
     shutdown_tx: watch::Sender<bool>,
     workers: Vec<RuntimeWorker>,
     stats: Arc<RuntimeStats>,
@@ -311,6 +394,68 @@ struct BrokerRuntime {
     engine: MqttEngine,
 }
 
+trait CommandPublishSink: Send + Sync {
+    fn try_enqueue_rendered(&self, command: RenderedCommand) -> Result<(), MqttEngineError>;
+}
+
+struct MqttCommandPublishSink {
+    handle: MqttHandle,
+}
+
+impl CommandPublishSink for MqttCommandPublishSink {
+    fn try_enqueue_rendered(&self, command: RenderedCommand) -> Result<(), MqttEngineError> {
+        let topic = command.topic().as_str().to_owned();
+        let qos = map_qos(command.qos());
+        let retain = command.retain();
+        self.handle
+            .try_enqueue_command(topic, qos, retain, command.into_payload())
+    }
+}
+
+struct CommandProcessorBroker {
+    broker_id: BrokerId,
+    sink: Arc<dyn CommandPublishSink>,
+}
+
+struct CommandProcessor {
+    project_id: ProjectId,
+    templates: Arc<Vec<CommandTemplate>>,
+    brokers: Arc<Vec<CommandProcessorBroker>>,
+    renderer: CommandTemplateRenderer,
+    stats: Arc<RuntimeStats>,
+}
+
+#[derive(Debug, Error)]
+enum RuntimeCommandProcessorError {
+    #[error("command request targets project '{actual}', but runtime owns project '{expected}'")]
+    ProjectMismatch {
+        expected: ProjectId,
+        actual: ProjectId,
+    },
+
+    #[error("command template '{template_id}' was not found")]
+    CommandTemplateNotFound { template_id: CommandTemplateId },
+
+    #[error("command template '{template_id}' is disabled")]
+    CommandTemplateDisabled { template_id: CommandTemplateId },
+
+    #[error("command render failed: {source}")]
+    Render {
+        #[source]
+        source: Box<CommandRenderError>,
+    },
+
+    #[error("broker '{broker_id}' is not running")]
+    BrokerUnavailable { broker_id: BrokerId },
+
+    #[error("MQTT command enqueue failed for broker '{broker_id}': {source}")]
+    PublishEnqueue {
+        broker_id: BrokerId,
+        #[source]
+        source: Box<MqttEngineError>,
+    },
+}
+
 impl ProjectRuntime {
     pub fn validate_config(config: &ProjectConfig) -> Result<(), RuntimeError> {
         validate_runtime_config(config)
@@ -327,6 +472,8 @@ impl ProjectRuntime {
         let stats = Arc::new(RuntimeStats::default());
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let (realtime_tx, _) = broadcast::channel(settings.realtime_event_capacity);
+        let (command_queue, command_rx) =
+            command_queue_channel(settings.command_queue_capacity, Arc::clone(&stats));
         let realtime_sink = RuntimeRealtimeSink::new(realtime_tx.clone(), Arc::clone(&stats));
 
         let (forwarder, forward_worker, forward_outcomes) =
@@ -377,12 +524,17 @@ impl ProjectRuntime {
         let persistence_handle = persistence_writer
             .as_ref()
             .map(RuntimePersistenceWriter::handle);
+        let command_processor = build_command_processor(&config, &mqtt_engines, Arc::clone(&stats));
 
         let mut workers = Vec::new();
         workers.push(RuntimeWorker::spawn("forwarder", async move {
             forward_worker.run(shutdown_rx).await;
             Ok(())
         }));
+        workers.push(RuntimeWorker::spawn(
+            "command-processor",
+            run_command_processor(command_rx, shutdown_tx.subscribe(), command_processor),
+        ));
         workers.push(RuntimeWorker::spawn(
             "forward-outcome-consumer",
             consume_forward_outcomes(
@@ -401,6 +553,7 @@ impl ProjectRuntime {
 
         Ok(Self {
             mqtt_engines,
+            command_queue,
             shutdown_tx,
             workers,
             stats,
@@ -427,6 +580,10 @@ impl ProjectRuntime {
         self.persistence_writer
             .as_ref()
             .map(|writer| writer.handle().stats())
+    }
+
+    pub fn command_queue_handle(&self) -> RuntimeCommandQueueHandle {
+        self.command_queue.clone()
     }
 
     pub fn execute_command(
@@ -481,6 +638,7 @@ impl ProjectRuntime {
     pub async fn shutdown(self) -> Result<(), RuntimeError> {
         let Self {
             mqtt_engines,
+            command_queue: _,
             shutdown_tx,
             workers,
             worker_join_timeout,
@@ -489,16 +647,16 @@ impl ProjectRuntime {
         } = self;
         let mut first_error = None;
 
-        for broker in mqtt_engines {
-            if let Err(error) = broker.engine.shutdown().await {
-                remember_first_error(&mut first_error, RuntimeError::from(error));
-            }
-        }
-
         let _ = shutdown_tx.send(true);
 
         if let Err(error) = join_workers(workers, worker_join_timeout).await {
             remember_first_error(&mut first_error, error);
+        }
+
+        for broker in mqtt_engines {
+            if let Err(error) = broker.engine.shutdown().await {
+                remember_first_error(&mut first_error, RuntimeError::from(error));
+            }
         }
 
         if let Some(writer) = persistence_writer
@@ -583,6 +741,177 @@ fn build_pending_broker_runtimes(
     }
 
     Ok(pending)
+}
+
+fn command_queue_channel(
+    capacity: usize,
+    stats: Arc<RuntimeStats>,
+) -> (
+    RuntimeCommandQueueHandle,
+    mpsc::Receiver<CommandExecutionRequest>,
+) {
+    let (tx, rx) = mpsc::channel(capacity);
+    (RuntimeCommandQueueHandle { tx, stats }, rx)
+}
+
+fn build_command_processor(
+    config: &ProjectConfig,
+    mqtt_engines: &[BrokerRuntime],
+    stats: Arc<RuntimeStats>,
+) -> CommandProcessor {
+    let brokers = mqtt_engines
+        .iter()
+        .map(|broker| {
+            let sink: Arc<dyn CommandPublishSink> = Arc::new(MqttCommandPublishSink {
+                handle: broker.engine.handle(),
+            });
+
+            CommandProcessorBroker {
+                broker_id: broker.broker_id.clone(),
+                sink,
+            }
+        })
+        .collect::<Vec<_>>();
+
+    CommandProcessor {
+        project_id: config.id.clone(),
+        templates: Arc::new(config.command_templates.clone()),
+        brokers: Arc::new(brokers),
+        renderer: CommandTemplateRenderer::default(),
+        stats,
+    }
+}
+
+async fn run_command_processor(
+    mut command_rx: mpsc::Receiver<CommandExecutionRequest>,
+    mut shutdown_rx: watch::Receiver<bool>,
+    processor: CommandProcessor,
+) -> Result<(), RuntimeError> {
+    loop {
+        tokio::select! {
+            biased;
+
+            changed = shutdown_rx.changed() => {
+                if changed.is_err() || *shutdown_rx.borrow() {
+                    command_rx.close();
+                    break;
+                }
+            }
+
+            request = command_rx.recv() => {
+                let Some(request) = request else {
+                    break;
+                };
+
+                process_and_record_command_request(&processor, &request);
+            }
+        }
+    }
+
+    while let Some(request) = command_rx.recv().await {
+        process_and_record_command_request(&processor, &request);
+    }
+
+    Ok(())
+}
+
+fn process_and_record_command_request(
+    processor: &CommandProcessor,
+    request: &CommandExecutionRequest,
+) {
+    match process_command_request(processor, request) {
+        Ok(()) => {
+            tracing::info!(
+                project_id = %request.project_id,
+                command_execution_id = %request.command_execution_id,
+                command_template_id = %request.command_template_id,
+                correlation_id = %request.correlation_id,
+                "command request rendered and enqueued to MQTT publish queue"
+            );
+        }
+        Err(error) => {
+            record_command_processor_error(&processor.stats, &error);
+            tracing::warn!(
+                project_id = %request.project_id,
+                command_execution_id = %request.command_execution_id,
+                command_template_id = %request.command_template_id,
+                correlation_id = %request.correlation_id,
+                error = %error,
+                "command processor failed"
+            );
+        }
+    }
+}
+
+fn process_command_request(
+    processor: &CommandProcessor,
+    request: &CommandExecutionRequest,
+) -> Result<(), RuntimeCommandProcessorError> {
+    if request.project_id != processor.project_id {
+        return Err(RuntimeCommandProcessorError::ProjectMismatch {
+            expected: processor.project_id.clone(),
+            actual: request.project_id.clone(),
+        });
+    }
+
+    let template = processor
+        .templates
+        .iter()
+        .find(|template| template.id == request.command_template_id)
+        .ok_or_else(|| RuntimeCommandProcessorError::CommandTemplateNotFound {
+            template_id: request.command_template_id.clone(),
+        })?;
+
+    if !template.enabled {
+        return Err(RuntimeCommandProcessorError::CommandTemplateDisabled {
+            template_id: template.id.clone(),
+        });
+    }
+
+    let rendered = processor
+        .renderer
+        .render(
+            CommandRenderContext {
+                project_id: request.project_id.clone(),
+                command_execution_id: request.command_execution_id.clone(),
+                correlation_id: request.correlation_id.clone(),
+            },
+            template,
+            &request.params,
+        )
+        .map_err(|source| RuntimeCommandProcessorError::Render {
+            source: Box::new(source),
+        })?;
+
+    let broker_id = rendered.broker_id().clone();
+    let broker = processor
+        .brokers
+        .iter()
+        .find(|broker| broker.broker_id == broker_id)
+        .ok_or_else(|| RuntimeCommandProcessorError::BrokerUnavailable {
+            broker_id: broker_id.clone(),
+        })?;
+
+    broker
+        .sink
+        .try_enqueue_rendered(rendered)
+        .map_err(|source| RuntimeCommandProcessorError::PublishEnqueue {
+            broker_id,
+            source: Box::new(source),
+        })
+}
+
+fn record_command_processor_error(stats: &RuntimeStats, error: &RuntimeCommandProcessorError) {
+    match error {
+        RuntimeCommandProcessorError::Render { .. } => stats.record_command_render_failed(),
+        RuntimeCommandProcessorError::PublishEnqueue { .. } => {
+            stats.record_command_publish_enqueue_failed();
+        }
+        RuntimeCommandProcessorError::ProjectMismatch { .. }
+        | RuntimeCommandProcessorError::CommandTemplateNotFound { .. }
+        | RuntimeCommandProcessorError::CommandTemplateDisabled { .. }
+        | RuntimeCommandProcessorError::BrokerUnavailable { .. } => {}
+    }
 }
 
 fn enabled_routes_for_broker(
@@ -888,6 +1217,12 @@ fn validate_runtime_settings(settings: &RuntimeSettings) -> Result<(), RuntimeEr
         ));
     }
 
+    if settings.command_queue_capacity == 0 {
+        return Err(RuntimeError::InvalidConfig(
+            "command queue capacity must be greater than zero",
+        ));
+    }
+
     Ok(())
 }
 
@@ -1102,13 +1437,16 @@ fn saturating_usize_to_u64(value: usize) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+    use std::sync::Mutex;
     use std::time::Duration;
 
     use pipe_bolt_domain::{
         ActionIntentTemplate, BackpressurePolicy, BrokerConnectionConfig, BrokerId,
-        CommandTemplate, CommandTemplateId, DeviceIdExtraction, HttpMethod, MqttQos,
-        PayloadCodecKind, ProjectConfig, ProjectId, ReconnectPolicy, RuleDefinition, RuleId,
-        RuleTrigger, SinkDefinition, SinkId, SinkKind, TlsMode, TopicFilter, TopicRouteConfig,
+        CommandExecutionId, CommandSource, CommandTemplate, CommandTemplateId, DeviceIdExtraction,
+        HttpMethod, MqttQos, PayloadCodecKind, ProjectConfig, ProjectId, ReconnectPolicy,
+        RuleDefinition, RuleId, RuleTrigger, SinkDefinition, SinkId, SinkKind, TlsMode,
+        TopicFilter, TopicRouteConfig,
     };
 
     use super::*;
@@ -1219,6 +1557,96 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn runtime_settings_should_reject_zero_command_queue_capacity() {
+        let settings = RuntimeSettings {
+            command_queue_capacity: 0,
+            ..RuntimeSettings::default()
+        };
+
+        let error = validate_runtime_settings(&settings).expect_err("invalid settings");
+
+        assert!(matches!(error, RuntimeError::InvalidConfig(_)));
+    }
+
+    #[test]
+    fn command_queue_should_report_full_when_capacity_is_exhausted() {
+        let stats = Arc::new(RuntimeStats::default());
+        let (handle, _rx) = command_queue_channel(1, Arc::clone(&stats));
+        handle
+            .try_enqueue(command_request("command-exec-1"))
+            .expect("first request queued");
+
+        let error = handle
+            .try_enqueue(command_request("command-exec-2"))
+            .expect_err("queue full");
+
+        assert_eq!(error, RuntimeCommandQueueError::Full);
+    }
+
+    #[test]
+    fn command_queue_should_report_closed_when_receiver_is_dropped() {
+        let stats = Arc::new(RuntimeStats::default());
+        let (handle, rx) = command_queue_channel(1, stats);
+        drop(rx);
+
+        let error = handle
+            .try_enqueue(command_request("command-exec-1"))
+            .expect_err("queue closed");
+
+        assert_eq!(error, RuntimeCommandQueueError::Closed);
+    }
+
+    #[test]
+    fn command_processor_should_render_and_enqueue_request_when_request_is_valid() {
+        let sink = Arc::new(RecordingCommandSink::default());
+        let processor =
+            command_processor_with_sink(command_template("command-1"), Arc::clone(&sink));
+        let request = command_request_with_params(BTreeMap::from([
+            ("device_id".to_owned(), serde_json::json!("device-1")),
+            ("state".to_owned(), serde_json::json!("ON")),
+        ]));
+
+        process_command_request(&processor, &request).expect("command processed");
+        let commands = sink.commands.lock().expect("commands lock");
+
+        assert_eq!(
+            commands[0].topic().as_str(),
+            "devices/device-1/commands/relay"
+        );
+    }
+
+    #[test]
+    fn command_processor_should_return_render_error_when_params_are_missing() {
+        let sink = Arc::new(RecordingCommandSink::default());
+        let processor = command_processor_with_sink(command_template("command-1"), sink);
+        let request = command_request_with_params(BTreeMap::from([(
+            "state".to_owned(),
+            serde_json::json!("ON"),
+        )]));
+
+        let error = process_command_request(&processor, &request).expect_err("render error");
+
+        assert!(matches!(error, RuntimeCommandProcessorError::Render { .. }));
+    }
+
+    #[test]
+    fn command_processor_should_return_publish_error_when_mqtt_queue_rejects_command() {
+        let sink = Arc::new(FailingCommandSink);
+        let processor = command_processor_with_sink(command_template("command-1"), sink);
+        let request = command_request_with_params(BTreeMap::from([
+            ("device_id".to_owned(), serde_json::json!("device-1")),
+            ("state".to_owned(), serde_json::json!("ON")),
+        ]));
+
+        let error = process_command_request(&processor, &request).expect_err("publish error");
+
+        assert!(matches!(
+            error,
+            RuntimeCommandProcessorError::PublishEnqueue { .. }
+        ));
+    }
+
     #[tokio::test]
     async fn shutdown_join_workers_reports_timeout() {
         let worker = RuntimeWorker::spawn("stuck-worker", async {
@@ -1325,6 +1753,78 @@ mod tests {
             qos: MqttQos::AtLeastOnce,
             retain: false,
             enabled: true,
+        }
+    }
+
+    fn command_request(command_execution_id: &str) -> CommandExecutionRequest {
+        command_request_with_id_and_params(
+            command_execution_id,
+            BTreeMap::from([
+                ("device_id".to_owned(), serde_json::json!("device-1")),
+                ("state".to_owned(), serde_json::json!("ON")),
+            ]),
+        )
+    }
+
+    fn command_request_with_params(
+        params: BTreeMap<String, serde_json::Value>,
+    ) -> CommandExecutionRequest {
+        command_request_with_id_and_params("command-exec-1", params)
+    }
+
+    fn command_request_with_id_and_params(
+        command_execution_id: &str,
+        params: BTreeMap<String, serde_json::Value>,
+    ) -> CommandExecutionRequest {
+        CommandExecutionRequest {
+            project_id: ProjectId::new("project-local").expect("project id"),
+            command_execution_id: CommandExecutionId::new(command_execution_id)
+                .expect("command execution id"),
+            command_template_id: CommandTemplateId::new("command-1").expect("command template id"),
+            params,
+            source: CommandSource::Api,
+            actor_id: None,
+            source_event_id: None,
+            correlation_id: "corr-1".to_owned(),
+            reason: Some("test command".to_owned()),
+        }
+    }
+
+    fn command_processor_with_sink<S>(template: CommandTemplate, sink: Arc<S>) -> CommandProcessor
+    where
+        S: CommandPublishSink + 'static,
+    {
+        let sink: Arc<dyn CommandPublishSink> = sink;
+
+        CommandProcessor {
+            project_id: ProjectId::new("project-local").expect("project id"),
+            templates: Arc::new(vec![template]),
+            brokers: Arc::new(vec![CommandProcessorBroker {
+                broker_id: BrokerId::new("broker-local").expect("broker id"),
+                sink,
+            }]),
+            renderer: CommandTemplateRenderer::default(),
+            stats: Arc::new(RuntimeStats::default()),
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingCommandSink {
+        commands: Mutex<Vec<RenderedCommand>>,
+    }
+
+    impl CommandPublishSink for RecordingCommandSink {
+        fn try_enqueue_rendered(&self, command: RenderedCommand) -> Result<(), MqttEngineError> {
+            self.commands.lock().expect("commands lock").push(command);
+            Ok(())
+        }
+    }
+
+    struct FailingCommandSink;
+
+    impl CommandPublishSink for FailingCommandSink {
+        fn try_enqueue_rendered(&self, _command: RenderedCommand) -> Result<(), MqttEngineError> {
+            Err(MqttEngineError::CommandQueueFull)
         }
     }
 
