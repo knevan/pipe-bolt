@@ -134,9 +134,15 @@ fn validate_action_template(action: &ActionIntentTemplate) -> Result<(), DomainE
             validate_text("metadata_key", key, 128)?;
             validate_text("metadata_value", value, 1024)
         }
+        ActionIntentTemplate::ExecuteCommand { params, .. } => {
+            for key in params.keys() {
+                validate_text("command_param_name", key, 160)?;
+            }
+
+            Ok(())
+        }
         ActionIntentTemplate::StreamToUi
         | ActionIntentTemplate::ForwardToSink { .. }
-        | ActionIntentTemplate::PublishCommand { .. }
         | ActionIntentTemplate::DropEvent => Ok(()),
     }
 }

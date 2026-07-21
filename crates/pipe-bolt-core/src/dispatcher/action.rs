@@ -253,9 +253,9 @@ where
                         Err(error) => outcome.failed.push(FailedAction { action_type, error }),
                     }
                 }
-                ActionIntent::PublishMqttCommand { .. } => {
+                ActionIntent::ExecuteCommand { .. } => {
                     outcome.skipped.push(SkippedAction::Unsupported {
-                        action_type: "publish_mqtt_command",
+                        action_type: "execute_command",
                     });
                 }
             }
@@ -336,8 +336,8 @@ fn intent_event_id(intent: &ActionIntent) -> Option<&EventId> {
         ActionIntent::StreamToUi { event_id }
         | ActionIntent::ForwardToSink { event_id, .. }
         | ActionIntent::DropEvent { event_id, .. }
-        | ActionIntent::AddMetadata { event_id, .. } => Some(event_id),
-        ActionIntent::PublishMqttCommand { .. } => None,
+        | ActionIntent::AddMetadata { event_id, .. }
+        | ActionIntent::ExecuteCommand { event_id, .. } => Some(event_id),
     }
 }
 
@@ -345,7 +345,7 @@ fn action_type(intent: &ActionIntent) -> &'static str {
     match intent {
         ActionIntent::StreamToUi { .. } => "stream_to_ui",
         ActionIntent::ForwardToSink { .. } => "forward_to_sink",
-        ActionIntent::PublishMqttCommand { .. } => "publish_mqtt_command",
+        ActionIntent::ExecuteCommand { .. } => "execute_command",
         ActionIntent::DropEvent { .. } => "drop_event",
         ActionIntent::AddMetadata { .. } => "add_metadata",
     }
@@ -356,8 +356,8 @@ mod tests {
     use std::collections::BTreeMap;
 
     use pipe_bolt_domain::{
-        ActionIntent, ActionIntentTemplate, BrokerId, DecodedPayload, EventId, FieldValue,
-        ProjectId, RouteId, RuleDefinition, RuleId, RuleTrigger, TopicName,
+        ActionIntent, ActionIntentTemplate, BrokerId, CommandTemplateId, DecodedPayload, EventId,
+        FieldValue, ProjectId, RouteId, RuleDefinition, RuleId, RuleTrigger, TopicName,
     };
     use serde_json::json;
     use time::OffsetDateTime;
@@ -635,6 +635,31 @@ mod tests {
             outcome.failed[0].error,
             DispatchError::InvalidMetadataKey { .. }
         ));
+    }
+
+    #[test]
+    fn execute_command_is_skipped_until_command_queue_is_wired() {
+        let (dispatcher, _rx) = dispatcher();
+        let event = event();
+
+        let outcome = dispatcher
+            .dispatch(
+                &event,
+                &[ActionIntent::ExecuteCommand {
+                    event_id: event.id.clone(),
+                    command_template_id: CommandTemplateId::new("relay-on").unwrap(),
+                    params: BTreeMap::new(),
+                    correlation_id: event.correlation_id.clone(),
+                }],
+            )
+            .unwrap();
+
+        assert_eq!(
+            outcome.skipped,
+            vec![SkippedAction::Unsupported {
+                action_type: "execute_command"
+            }]
+        );
     }
 
     #[tokio::test]

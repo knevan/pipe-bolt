@@ -192,15 +192,11 @@ fn validate_action(
     match action {
         ActionIntentTemplate::StreamToUi
         | ActionIntentTemplate::DropEvent
+        | ActionIntentTemplate::ExecuteCommand { .. }
         | ActionIntentTemplate::ForwardToSink { .. } => Ok(()),
         ActionIntentTemplate::AddMetadata { key, value } => {
             validate_metadata_action(rule, key, value, limits)
         }
-        ActionIntentTemplate::PublishCommand { .. } => Err(RuleError::UnsupportedAction {
-            rule_id: rule.id.to_string(),
-            action: "publish_command",
-        }
-        .into()),
     }
 }
 
@@ -477,11 +473,15 @@ fn action_to_intent(
             sink_id: sink_id.clone(),
             projection: None,
         }),
-        ActionIntentTemplate::PublishCommand { .. } => Err(RuleError::UnsupportedAction {
-            rule_id: rule.id.to_string(),
-            action: "publish_command",
-        }
-        .into()),
+        ActionIntentTemplate::ExecuteCommand {
+            command_template_id,
+            params,
+        } => Ok(ActionIntent::ExecuteCommand {
+            event_id: event.id.clone(),
+            command_template_id: command_template_id.clone(),
+            params: params.clone(),
+            correlation_id: event.correlation_id.clone(),
+        }),
     }
 }
 
@@ -510,8 +510,8 @@ mod tests {
     use std::collections::BTreeMap;
 
     use pipe_bolt_domain::{
-        ActionIntentTemplate, BrokerId, ConditionExpr, EventId, FieldPath, FieldRef, FieldValue,
-        ProjectId, RouteId, RuleId, RuleTrigger, TopicName, ValueExpr,
+        ActionIntentTemplate, BrokerId, CommandTemplateId, ConditionExpr, EventId, FieldPath,
+        FieldRef, FieldValue, ProjectId, RouteId, RuleId, RuleTrigger, TopicName, ValueExpr,
     };
     use serde_json::json;
     use time::OffsetDateTime;
@@ -844,6 +844,33 @@ mod tests {
         assert!(matches!(
             &evaluation.intents[0],
             ActionIntent::ForwardToSink { sink_id: actual, .. } if actual == &sink_id
+        ));
+    }
+
+    #[test]
+    fn emits_execute_command_intent_without_transport_fields() {
+        let command_template_id = CommandTemplateId::new("relay-on").unwrap();
+        let engine = RuleEngine::new(vec![rule(
+            None,
+            vec![ActionIntentTemplate::ExecuteCommand {
+                command_template_id: command_template_id.clone(),
+                params: BTreeMap::from([("device_id".to_owned(), json!("device-1"))]),
+            }],
+        )])
+        .unwrap();
+
+        let evaluation = engine.evaluate(&event()).unwrap();
+
+        assert!(matches!(
+            &evaluation.intents[0],
+            ActionIntent::ExecuteCommand {
+                command_template_id: actual,
+                params,
+                correlation_id,
+                ..
+            } if actual == &command_template_id
+                && params.get("device_id") == Some(&json!("device-1"))
+                && correlation_id == "evt-test"
         ));
     }
 
