@@ -1684,8 +1684,9 @@ fn saturating_usize_to_u64(value: usize) -> u64 {
 mod tests {
     use std::collections::BTreeMap;
     use std::sync::Mutex;
-    use std::time::Duration;
+    use std::time::{Duration, SystemTime};
 
+    use pipe_bolt_core::forwarder::HttpForwardWorker;
     use pipe_bolt_domain::{
         ActionIntentTemplate, BackpressurePolicy, BrokerConnectionConfig, BrokerId,
         CommandExecutionId, CommandSource, CommandTemplate, CommandTemplateId, DeviceIdExtraction,
@@ -1988,6 +1989,105 @@ mod tests {
         assert_eq!(stats.snapshot().command_publish_failed_total, 1);
     }
 
+    #[test]
+    fn command_renderer_should_produce_same_transport_for_api_and_rule_requests() {
+        let renderer = CommandTemplateRenderer::default();
+        let template = command_template("command-1");
+        let params = BTreeMap::from([
+            ("device_id".to_owned(), serde_json::json!("device-1")),
+            ("state".to_owned(), serde_json::json!("ON")),
+        ]);
+        let api = renderer
+            .render(
+                command_render_context("command-exec-api"),
+                &template,
+                &params,
+            )
+            .expect("api command renders");
+        let rule = renderer
+            .render(
+                command_render_context("command-exec-rule"),
+                &template,
+                &params,
+            )
+            .expect("rule command renders");
+
+        assert_eq!(
+            (
+                api.topic().as_str(),
+                api.payload(),
+                api.qos(),
+                api.retain(),
+                api.payload_size_bytes()
+            ),
+            (
+                rule.topic().as_str(),
+                rule.payload(),
+                rule.qos(),
+                rule.retain(),
+                rule.payload_size_bytes()
+            )
+        );
+    }
+
+    #[test]
+    fn pipeline_should_stream_normalized_event_when_rule_streams_to_ui() {
+        let config = project_config();
+        let stats = Arc::new(RuntimeStats::default());
+        let (realtime_tx, mut realtime_rx) = broadcast::channel(8);
+        let (dispatcher, _forwarder_stats, _forward_worker, _forward_outcomes) = runtime_dispatcher(
+            RuntimeRealtimeSink::new(realtime_tx, Arc::clone(&stats)),
+            Vec::new(),
+            Arc::clone(&stats),
+        );
+        let message = telemetry_message();
+
+        handle_pipeline_message(
+            &ConfigRouteMatcher::new(config.id.clone(), config.routes.clone()).expect("matcher"),
+            &EventNormalizer::default(),
+            &[],
+            &RuleEngine::with_limits(config.rules, RuleEngineLimits::default())
+                .expect("rule engine"),
+            &dispatcher,
+            &stats,
+            &message,
+        )
+        .expect("pipeline handles message");
+        let event = realtime_rx.try_recv().expect("streamed event");
+
+        assert_eq!(event.topic.as_str(), "devices/device-1/telemetry");
+    }
+
+    #[test]
+    fn pipeline_should_enqueue_forward_request_when_rule_forwards_to_sink() {
+        let mut config = project_config();
+        config.rules[0].actions = vec![ActionIntentTemplate::ForwardToSink {
+            sink_id: SinkId::new("sink-webhook").expect("sink id"),
+        }];
+        config.sinks.push(webhook_sink("sink-webhook"));
+        let stats = Arc::new(RuntimeStats::default());
+        let (dispatcher, forwarder_stats, _forward_worker, _forward_outcomes) = runtime_dispatcher(
+            RuntimeRealtimeSink::new(broadcast::channel(8).0, Arc::clone(&stats)),
+            config.sinks.clone(),
+            Arc::clone(&stats),
+        );
+        let message = telemetry_message();
+
+        handle_pipeline_message(
+            &ConfigRouteMatcher::new(config.id.clone(), config.routes.clone()).expect("matcher"),
+            &EventNormalizer::default(),
+            &[],
+            &RuleEngine::with_limits(config.rules, RuleEngineLimits::default())
+                .expect("rule engine"),
+            &dispatcher,
+            &stats,
+            &message,
+        )
+        .expect("pipeline handles message");
+
+        assert_eq!(forwarder_stats.snapshot().accepted_total, 1);
+    }
+
     #[tokio::test]
     async fn shutdown_join_workers_reports_timeout() {
         let worker = RuntimeWorker::spawn("stuck-worker", async {
@@ -2168,6 +2268,54 @@ mod tests {
             status,
             failure_reason,
         }
+    }
+
+    fn command_render_context(command_execution_id: &str) -> CommandRenderContext {
+        CommandRenderContext {
+            project_id: ProjectId::new("project-local").expect("project id"),
+            command_execution_id: CommandExecutionId::new(command_execution_id)
+                .expect("command execution id"),
+            correlation_id: "corr-1".to_owned(),
+        }
+    }
+
+    fn runtime_dispatcher(
+        realtime_sink: RuntimeRealtimeSink,
+        sinks: Vec<SinkDefinition>,
+        stats: Arc<RuntimeStats>,
+    ) -> (
+        RuntimeDispatcher,
+        Arc<ForwarderStats>,
+        HttpForwardWorker,
+        mpsc::Receiver<ForwardDeliveryOutcome>,
+    ) {
+        let (forwarder, worker, outcomes) = BoundedHttpForwarder::try_channel_with_policy(
+            sinks,
+            ForwardLimits::default(),
+            EgressPolicy::default(),
+        )
+        .expect("forwarder channel");
+        let forwarder_stats = forwarder.stats();
+        let (command_queue, _command_rx) = command_queue_channel(8, stats);
+        let dispatcher = ActionDispatcher::with_limits_and_command_queue(
+            realtime_sink,
+            forwarder,
+            command_queue,
+            DispatchLimits::default(),
+        );
+
+        (dispatcher, forwarder_stats, worker, outcomes)
+    }
+
+    fn telemetry_message() -> MqttMessage {
+        MqttMessage::new(
+            "devices/device-1/telemetry",
+            QoS::AtLeastOnce,
+            false,
+            br#"{"temperature":42}"#.to_vec(),
+            SystemTime::now(),
+        )
+        .expect("MQTT message")
     }
 
     #[derive(Default)]

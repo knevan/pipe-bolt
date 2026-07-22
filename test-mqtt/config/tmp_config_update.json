@@ -1,0 +1,146 @@
+{
+  "expected_version": 8,
+  "reason": "Apply MVP demo config",
+  "config": {
+    "project_id": "project-dev-1",
+    "name": "Local Development Project",
+    "description": "Local MVP demo: MQTT telemetry -> normalize -> rule -> stream, forward, and command publish",
+    "enabled": true,
+    "version": 9,
+    "brokers": [
+      {
+        "id": "broker-local",
+        "name": "Local MQTT Broker",
+        "host": "127.0.0.1",
+        "port": 1883,
+        "tls": "disabled",
+        "keep_alive": 30,
+        "clean_session": true,
+        "client_id": "pipe-bolt-local-client",
+        "reconnect": {
+          "min_delay": 500,
+          "max_delay": 30000
+        },
+        "enabled": true
+      }
+    ],
+    "routes": [
+      {
+        "id": "route-local-telemetry",
+        "broker_id": "broker-local",
+        "name": "Local Telemetry Route",
+        "topic_filter": "devices/+/telemetry",
+        "codec": "json",
+        "schema_mapping_id": "schema-temperature",
+        "device_id": {
+          "type": "topic_wildcard_index",
+          "index": 0
+        },
+        "event_type": "telemetry",
+        "qos": "at_most_once",
+        "enabled": true,
+        "backpressure": "reject"
+      }
+    ],
+    "schema_mappings": [
+      {
+        "id": "schema-temperature",
+        "name": "Temperature Telemetry Mapping",
+        "fields": [
+          {
+            "source": "temperature",
+            "target": "temperature",
+            "value_type": "number",
+            "required": true,
+            "default": null
+          },
+          {
+            "source": "humidity",
+            "target": "humidity",
+            "value_type": "number",
+            "required": false,
+            "default": null
+          },
+          {
+            "source": "status",
+            "target": "status",
+            "value_type": "string",
+            "required": false,
+            "default": "unknown"
+          }
+        ]
+      }
+    ],
+    "rules": [
+      {
+        "id": "rule-temperature-warning",
+        "name": "Temperature Warning Demo",
+        "enabled": true,
+        "trigger": {
+          "type": "event_received"
+        },
+        "condition": {
+          "op": "greater_than",
+          "left": {
+            "type": "field",
+            "field": {
+              "source": "extracted",
+              "name": "temperature"
+            }
+          },
+          "right": {
+            "type": "literal",
+            "value": 40
+          }
+        },
+        "actions": [
+          {
+            "type": "stream_to_ui"
+          },
+          {
+            "type": "forward_to_sink",
+            "sink_id": "sink-demo-webhook"
+          },
+          {
+            "type": "execute_command",
+            "command_template_id": "relay_on",
+            "params": {
+              "device_id": "device-001",
+              "state": "ON"
+            }
+          }
+        ]
+      }
+    ],
+    "command_templates": [
+      {
+        "id": "relay_on",
+        "name": "Relay On Command",
+        "broker_id": "broker-local",
+        "topic_template": "devices/{device_id}/command/relay",
+        "payload_template": {
+          "relay": 1,
+          "state": "{state}",
+          "source": "pipe-bolt-demo"
+        },
+        "qos": "at_most_once",
+        "retain": false,
+        "enabled": true
+      }
+    ],
+    "sinks": [
+      {
+        "id": "sink-demo-webhook",
+        "name": "Demo Webhook Sink",
+        "enabled": true,
+        "kind": {
+          "type": "webhook",
+          "url": "https://example.com/pipe-bolt-demo",
+          "method": "POST",
+          "headers": [],
+          "timeout": 2000
+        }
+      }
+    ]
+  }
+}

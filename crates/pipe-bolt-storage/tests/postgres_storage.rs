@@ -1,16 +1,18 @@
-﻿use std::sync::Arc;
+use std::sync::Arc;
 use std::time::Duration;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use pipe_bolt_domain::{
-    BackpressurePolicy, BrokerConnectionConfig, BrokerId, DeviceIdExtraction, MqttCredentials,
-    MqttQos, PayloadCodecKind, ProjectConfig, ProjectId, ReconnectPolicy, RouteId, SecretString,
-    SinkDefinition, SinkId, SinkKind, TlsMode, TopicFilter, TopicRouteConfig,
+    BackpressurePolicy, BrokerConnectionConfig, BrokerId, CommandExecutionId, CommandTemplateId,
+    DeviceIdExtraction, MqttCredentials, MqttQos, PayloadCodecKind, ProjectConfig, ProjectId,
+    ReconnectPolicy, RouteId, SecretString, SinkDefinition, SinkId, SinkKind, TlsMode, TopicFilter,
+    TopicRouteConfig,
 };
 use pipe_bolt_storage::error::StorageError;
 use pipe_bolt_storage::model::{
-    AuditContext, FailureSeverity, NewFailureEvent, NewSinkDeliveryOutcome, SinkDeliveryStatus,
+    AuditContext, CommandExecutionStatus, FailureSeverity, NewCommandExecution, NewFailureEvent,
+    NewSinkDeliveryOutcome, SinkDeliveryStatus,
 };
 use pipe_bolt_storage::postgres::{PostgresStorage, PostgresStorageConfig};
 use pipe_bolt_storage::secret::StorageKeyring;
@@ -156,6 +158,80 @@ async fn resolve_failure_sets_project_scoped_audit_event() {
     assert_eq!(project_id, config.id.to_string());
 }
 
+#[tokio::test]
+async fn command_execution_publish_success_updates_status() {
+    let Some(storage) = migrated_storage().await else {
+        return;
+    };
+    let config = project_config(&unique_project_id("project-command-published"));
+    storage
+        .create_project_config(&config, AuditContext::system("test create"))
+        .await
+        .expect("create config");
+    let command_execution_id =
+        CommandExecutionId::new(unique_id("command-exec-published")).expect("command execution id");
+    storage
+        .record_command_execution(command_execution(&config.id, &command_execution_id))
+        .await
+        .expect("record command execution");
+
+    storage
+        .mark_command_execution_published(&command_execution_id)
+        .await
+        .expect("mark command published");
+    let row = sqlx::query(
+        "SELECT status, failure_reason FROM command_executions WHERE command_execution_id = $1",
+    )
+    .bind(command_execution_id.as_str())
+    .fetch_one(storage.pool())
+    .await
+    .expect("command execution row");
+    let status: String = row.try_get("status").expect("status");
+    let failure_reason: Option<String> = row.try_get("failure_reason").expect("failure_reason");
+
+    assert_eq!((status, failure_reason), ("published".to_owned(), None));
+}
+
+#[tokio::test]
+async fn command_execution_publish_failure_updates_status_and_reason() {
+    let Some(storage) = migrated_storage().await else {
+        return;
+    };
+    let config = project_config(&unique_project_id("project-command-failed"));
+    storage
+        .create_project_config(&config, AuditContext::system("test create"))
+        .await
+        .expect("create config");
+    let command_execution_id =
+        CommandExecutionId::new(unique_id("command-exec-failed")).expect("command execution id");
+    storage
+        .record_command_execution(command_execution(&config.id, &command_execution_id))
+        .await
+        .expect("record command execution");
+
+    storage
+        .mark_command_execution_failed(&command_execution_id, "mqtt client disconnected")
+        .await
+        .expect("mark command failed");
+    let row = sqlx::query(
+        "SELECT status, failure_reason FROM command_executions WHERE command_execution_id = $1",
+    )
+    .bind(command_execution_id.as_str())
+    .fetch_one(storage.pool())
+    .await
+    .expect("command execution row");
+    let status: String = row.try_get("status").expect("status");
+    let failure_reason: Option<String> = row.try_get("failure_reason").expect("failure_reason");
+
+    assert_eq!(
+        (status, failure_reason),
+        (
+            "failed".to_owned(),
+            Some("mqtt client disconnected".to_owned())
+        )
+    );
+}
+
 async fn migrated_storage() -> Option<PostgresStorage> {
     let storage = test_storage().await?;
     storage.migrate().await.expect("migration applies");
@@ -175,7 +251,32 @@ async fn test_storage() -> Option<PostgresStorage> {
 }
 
 fn unique_project_id(prefix: &str) -> String {
+    unique_id(prefix)
+}
+
+fn unique_id(prefix: &str) -> String {
     format!("{prefix}-{}", uuid::Uuid::now_v7())
+}
+
+fn command_execution(
+    project_id: &ProjectId,
+    command_execution_id: &CommandExecutionId,
+) -> NewCommandExecution {
+    NewCommandExecution {
+        command_execution_id: command_execution_id.clone(),
+        project_id: project_id.clone(),
+        command_template_id: CommandTemplateId::new("command-template-1")
+            .expect("command template id"),
+        broker_id: BrokerId::new("broker-local").expect("broker id"),
+        actor_id: None,
+        status: CommandExecutionStatus::Queued,
+        topic: "devices/device-1/commands/relay".to_owned(),
+        qos: MqttQos::AtLeastOnce,
+        retain: false,
+        payload_size_bytes: 14,
+        failure_reason: None,
+        reason: Some("test command".to_owned()),
+    }
 }
 
 fn project_config(id: &str) -> ProjectConfig {

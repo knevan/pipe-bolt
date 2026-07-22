@@ -1,0 +1,10 @@
+{
+  "topic": "devices/device-001/command/relay",
+  "payload": {
+    "relay": 1,
+    "state": "ON",
+    "source": "pipe-bolt-demo"
+  },
+  "qos": "at_most_once",
+  "retain": false
+}
